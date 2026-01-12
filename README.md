@@ -1,0 +1,19 @@
+# Motivation
+
+ the shellylora was ok, but due to the local setup the signal strength was pretty weak, and at a better lora location wifi was not good. i.e. i had a lot of missing and corrupt data.
+
+# Setup
+
+ at first i tried a waveshare esp32 p4 nano board, but had problems with SPI, see below, then i used a waveshare esp32 p4 dev board with a POE hat
+ 
+## hardware
+ - waveshare ESP32-P4 POE ETH Entwicklungsboard mit PoE Modul, pinout https://www.waveshare.com/wiki/ESP32-P4-ETH?srsltid=AfmBOooyZypx7zT_zXIXvzyBKMioBOeLTpoagiUQXCFh9IVxTwZBkBLn#Pinout_Definition
+ - waveshare sx1262 core board https://www.waveshare.com/wiki/Core1262-868M#Demo_Example
+ - Nelawya 868MHz LoRa Antenne Omni-Directional 3dbi Gain SMA Male LoraWan Antenne
+
+## software
+base is the esp32bme code, but added ethernet capability and the lora receiver code
+
+it took quite a while to get it working, since at first i had tried a waveshare p4 nano board https://www.waveshare.com/wiki/ESP32-P4-Nano-StartPage#Pinout_Definition 
+but did not have any luck getting it to work. BUSY stayed high, and despite attempts to find docs/examples and asking both chatgpt and claude vor suggestions i frist tried
+the sx1262 on an esp32s3 board and lora worked without problems, and then move to the esp32 p4 board since at the location where the lora reception was good i had POE.
