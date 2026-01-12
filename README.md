@@ -15,8 +15,8 @@ this is an example of how to get simple lora receiver going using an esp32 p4 bo
 ## software
 base is the esp32bme code, but added ethernet capability and the lora receiver code.
 yes, the code needs a lot of cleanup, this is a prototype proof of concept and has a lot of other esp32 sensor code still included, it uses
-- arduino ide for development
-- [RadioLib](https://github.com/jgromes/RadioLib) for the communication with the sx1262 board
+- arduino ide for development, v2.3.7
+- [RadioLib](https://github.com/jgromes/RadioLib) 7.5.0 for the communication with the sx1262 board
 
 it took quite a while to get it working, since at first i had tried a waveshare p4 nano board https://www.waveshare.com/wiki/ESP32-P4-Nano-StartPage#Pinout_Definition 
 but did not have any luck getting it to work. BUSY stayed high, and despite attempts to find docs/examples and asking both chatgpt and claude vor suggestions i frist tried
