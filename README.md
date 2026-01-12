@@ -22,15 +22,16 @@ the sx1262 on an esp32s3 board and lora worked without problems, and then move t
 ## signal
 at the same location as the shelly lora addon reciever, here is a comparison, rough values, off course they fluctuate, but def. a lot better
 
-shelly add on   RSSI: -118 dBm, SNR: -11 dB
-esp32 p4 setup: RSSI: -105 dBm, SNR: -1,5 dB
+- shelly add on   RSSI: -118 dBm, SNR: -11 dB
+- esp32 p4 setup: RSSI: -105 dBm, SNR: -1,5 dB
 
 time will tell how stable this is, and how much additional data filtering i have to add to the HA sensors where the data are consumed.
 
 ## notes
 - do NOT run the lora rcv task on core 0, you will get errors
- `E (22096) task_wdt: Task watchdog got triggered. The following tasks/users did not reset the watchdog in time:
-  E (22096) task_wdt:  - IDLE0 (CPU 0)`
+  
+ >E (22096) task_wdt: Task watchdog got triggered. The following tasks/users did not reset the watchdog in time:  
+ >E (22096) task_wdt:  - IDLE0 (CPU 0)`
 
 # todo
 - figure out a working set of pins on the nano board
