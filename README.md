@@ -1,6 +1,7 @@
 # Motivation
 
- the shellylora was ok, but due to the local setup the signal strength was pretty weak, and at a better lora location wifi was not good. i.e. i had a lot of missing and corrupt data.
+the shellylora was ok, but due to the local setup the signal strength was pretty weak, and at a better lora location wifi was not good. i.e. i had a lot of missing and corrupt data.   
+this is an example of how to get simple lora receiver going using an esp32 p4 board and an sx1262 addon board
 
 # Setup
 
@@ -8,12 +9,14 @@
  
 ## hardware
  - waveshare ESP32-P4 POE ETH Entwicklungsboard mit PoE Modul, pinout https://www.waveshare.com/wiki/ESP32-P4-ETH?srsltid=AfmBOooyZypx7zT_zXIXvzyBKMioBOeLTpoagiUQXCFh9IVxTwZBkBLn#Pinout_Definition
- - waveshare sx1262 core board https://www.waveshare.com/wiki/Core1262-868M#Demo_Example
+ - waveshare sx1262 HF core board https://www.waveshare.com/wiki/Core1262-868M#Demo_Example
  - Nelawya 868MHz LoRa Antenne Omni-Directional 3dbi Gain SMA Male LoraWan Antenne
 
 ## software
 base is the esp32bme code, but added ethernet capability and the lora receiver code.
-yes, the code needs a lot of cleanup, this is a prototype proof of concept and has a lot of other esp32 sensor code still included
+yes, the code needs a lot of cleanup, this is a prototype proof of concept and has a lot of other esp32 sensor code still included, it uses
+- arduino ide for development
+- [RadioLib](https://github.com/jgromes/RadioLib) for the communication with the sx1262 board
 
 it took quite a while to get it working, since at first i had tried a waveshare p4 nano board https://www.waveshare.com/wiki/ESP32-P4-Nano-StartPage#Pinout_Definition 
 but did not have any luck getting it to work. BUSY stayed high, and despite attempts to find docs/examples and asking both chatgpt and claude vor suggestions i frist tried
