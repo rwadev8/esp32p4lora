@@ -17,3 +17,9 @@ base is the esp32bme code, but added ethernet capability and the lora receiver c
 it took quite a while to get it working, since at first i had tried a waveshare p4 nano board https://www.waveshare.com/wiki/ESP32-P4-Nano-StartPage#Pinout_Definition 
 but did not have any luck getting it to work. BUSY stayed high, and despite attempts to find docs/examples and asking both chatgpt and claude vor suggestions i frist tried
 the sx1262 on an esp32s3 board and lora worked without problems, and then move to the esp32 p4 board since at the location where the lora reception was good i had POE.
+
+## signal
+at the same location as the shelly lora addon reciever, here is a comparison, rough values, off course they fluctuate, but def. a lot better
+
+shelly add on   RSSI: -118 dBm, SNR: -11 dB
+esp32 p4 setup: RSSI: -105 dBm, SNR: -1,5 dB
