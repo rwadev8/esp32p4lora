@@ -8,11 +8,10 @@
 // 3.0 p4 eth
 // 3.0.1 add wifi back in and enable wifi at compile time
 // 3.0.2 integrate sx1262 lora module, seems to only work on p4 dev, not the waveshare nano board
+// 3.0.5 add DEFINE for MQTT, in debug set LAN and MQTT to 0 and LORA to 1 to be able to just test LORA
+// 3.0.6 add /reset page, print lora msg as hex
 
 #define PROD 1 //  REMEMBER to change to 1 for prod deploy
-#define LAN 1 // 0 to disable, 1 to enable
-#define WLAN 0 // 0 to disable, 1 to enable
-#define LORA 1
 
 #include <Arduino.h>
 #include <ETH.h>
@@ -27,7 +26,18 @@
 #include "esp32-hal-cpu.h"
 #include "time.h"
 
-const char VERSION[] = "v3.0.3";
+// enable/disable feature at compile
+#define LAN 1  // 0 to disable, 1 to enable
+#define WLAN 0 // 0 to disable, 1 to enable
+#define LORA 1 
+#define MQTTenable 1 // set to 0 for debug
+#define NTP 1
+
+#define BUFLEN 64
+#define ERRBUFLEN 265
+
+const char VERSION[] = "v3.0.6";
+char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
   #define ETH_PHY_TYPE  ETH_PHY_IP101  // IP101GRI chip
@@ -75,7 +85,7 @@ int mqttPubInt = 30 * 1000;
 #if PROD == 1
   const char mqttTopicBufferTemp[] = "iot/power/h6/status"; 
 #else
-  const char mqttTopicBufferTemp[] = "iot/power/TEST"; 
+  const char mqttTopicBufferTemp[] = "iot/power/h6/test"; 
 #endif
 
 unsigned long mqttPublishTime = 0;
@@ -90,8 +100,10 @@ int cntBadBme = 0;
 int cntBme = 0;
 int cntConsBadBme = 0;
 int cntLora = 0;
+int cntLoraOk = 0;
 int cntLoraErr = 0;
 int cntLoraInv = 0;
+int cntLoraChecksum = 0;
 
 const int initTemp = 15.0;
 
@@ -131,6 +143,9 @@ TaskHandle_t TWatchDog;
 #endif  
 
 // h6 lora
+char currMsg[BUFLEN * 3 + 1];
+char lastGoodMsg[BUFLEN * 3 + 1];
+
 struct ShellyData {
   uint32_t h6energy;    // Wh
   int16_t h6power;      // W (can be negative)
@@ -221,12 +236,60 @@ int16_t bytesToInt16(uint8_t* bytes, int offset) {
   return (int16_t)val;
 }
 
+void bufferToHex(const uint8_t *buf, size_t len, char *out, size_t outSize) {
+  // Required size: len * 3 (AA␠) or len * 2 + 1 (no spaces)
+  if (outSize < (len * 3)) return;
+
+  char *p = out;
+  for (size_t i = 0; i < len; i++) {
+    sprintf(p, "%02X", buf[i]);
+    p += 2;
+    if (i < len - 1) *p++ = ' ';
+  }
+  *p = '\0';
+}
+
+void logError(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  // Write into the global buffer
+  vsnprintf(lastError, ERRBUFLEN, fmt, args);
+  
+  va_end(args);
+
+  // Optionally also print to Serial
+  Serial.printf("%s\n", lastError);
+}
+
+////////////////////////////
+
+uint8_t calculateXorChecksum(uint8_t* data, size_t len) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < len; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
+}
+
 bool parseLoraPayload(uint8_t* data, size_t len, ShellyData* result) {
-  if (len != 12) {
-    Serial.printf("Warning: Unexpected payload length: %d bytes (expected 12)\n", len);
+  if (len != 13) {  // Changed from 12 to 13
+    logError("Warning: Unexpected payload length: %d bytes (expected 13)\n", len);
     return false;
   }
   
+  // Verify checksum
+  uint8_t receivedChecksum = data[12];
+  uint8_t calculatedChecksum = calculateXorChecksum(data, 12);
+  
+  if (receivedChecksum != calculatedChecksum) {
+    cntLoraChecksum++;
+    logError("Checksum failed! Received: 0x%02X, Calculated: 0x%02X\n", 
+                  receivedChecksum, calculatedChecksum);
+    return false;
+  }
+  
+  // Parse data (same as before)
   result->h6energy = bytesToUint32(data, 0);
   result->h6power = bytesToInt16(data, 4);
   result->h6pvenergy = bytesToUint32(data, 6);
@@ -246,31 +309,53 @@ void printShellyData(const ShellyData& data) {
 bool validateShellyData(const ShellyData& current, const ShellyData& previous, bool hasPrevious) {
   // Check pvpower range (0 to 950W)
   if (current.h6pvpower < 0 || current.h6pvpower > 950) {
-    Serial.printf("Validation failed: pvpower %d out of range [0, 950]\n", current.h6pvpower);
+    logError("  WARN  pvpower %d out of range [0, 950]\n", current.h6pvpower);
     return false;
   }
   
   // Check house power range (example: -10000 to 32000W)
   if (current.h6power < -950 || current.h6power > 5000) {
-    Serial.printf("Validation failed: power %d out of range\n", current.h6power);
+    logError("  WARN  power %d out of range\n", current.h6power);
     return false;
   }
-  
-  /*
-  // Only check jumps if we have previous data todo
+
+  // Only check jumps if we have previous data
   if (hasPrevious) {
-    // Check for unreasonable energy jumps (e.g., max 10kWh increase between readings)
-    int32_t energyDiff = (int32_t)current.h6energy - (int32_t)previous.h6energy;
-    if (abs(energyDiff) > 10000) {
-      Serial.printf("Validation failed: energy jump too large: %d Wh\n", energyDiff);
+    // coarse check energy data
+    if (cntLora != 2 && current.h6energy < previous.h6energy) {
+      logError("  WARN: energy decreased to %d from %d\n", current.h6energy, previous.h6energy);
       return false;
     }
+    if (cntLora != 2 && current.h6pvenergy < previous.h6pvenergy) {
+      logError("  WARN: pv energy decreased to %d from %d\n", current.h6pvenergy, previous.h6pvenergy);
+      return false;
+    }
+
+    // Check for upward energy jump > 1%
+    if (cntLora != 2 && current.h6energy > previous.h6energy) {
+      float increasePercent = ((float)(current.h6energy - previous.h6energy) / previous.h6energy) * 100.0;
+      if (increasePercent > 1.0) {
+        logError("Validation failed: h6energy increased by %.2f%% (%u -> %u Wh)\n", 
+                      increasePercent, previous.h6energy, current.h6energy);
+        return false;
+      }
+    }
+    
+    // Check for upward PV energy jump > 1%
+    if (cntLora != 2 && current.h6pvenergy > previous.h6pvenergy) {
+      float pvIncreasePercent = ((float)(current.h6pvenergy - previous.h6pvenergy) / previous.h6pvenergy) * 100.0;
+      if (pvIncreasePercent > 1.0) {
+        logError("Validation failed: h6pvenergy increased by %.2f%% (%u -> %u Wh)\n", 
+                      pvIncreasePercent, previous.h6pvenergy, current.h6pvenergy);
+        return false;
+      }
+    }
   }
-  */
-  
+    
   return true;
 }
 
+/////////////////////////////////////////////////
 // tasks
      
 void PostMQTT(void * parameter) {
@@ -278,6 +363,7 @@ void PostMQTT(void * parameter) {
   delay(5000);
 
   for(;;) {
+#if MQTTenable == 1    
     if(!mqtt.connected()) {
       //TODO a reconnect would be really helpful here
       Serial.print("m");
@@ -286,7 +372,7 @@ void PostMQTT(void * parameter) {
       cntMReCon++;
     }
     mqtt.loop(); // this i supposed to keep the connection alive according to chatcpt
-    
+#endif    
     // for lora do not publish  
 #if LORA != 1      
     if(millis() - mqttPublishTime > mqttPubInt) {
@@ -379,18 +465,18 @@ void WatchDog(void * parameter) {
 }
 
 void LoraReceiveTask(void* parameter) {
-  uint8_t buffer[255];
-  
+  uint8_t buffer[BUFLEN];
   Serial.println("LoRa receive task started");
   
   for(;;) {
     // Set a short timeout for receive (e.g., 1 second)
     radio.setDio1Action(NULL);  // Disable interrupt
-    int state = radio.receive(buffer, 255);
+    int state = radio.receive(buffer, BUFLEN);
     
     if (state == RADIOLIB_ERR_NONE) {
+      cntLora++;
       size_t len = radio.getPacketLength();
-      
+      bufferToHex(buffer, len, currMsg, BUFLEN);
       Serial.printf("LoRa packet received: %d bytes\n", len);
       
       Serial.print("Raw data: ");
@@ -406,10 +492,11 @@ void LoraReceiveTask(void* parameter) {
         printShellyData(data);
         if (validateShellyData(data, h6EnPV_prev, h6EnPV_valid)) {
           // Data is good - update global and save as previous
-          cntLora++;
+          cntLoraOk++;
           h6EnPV_prev = h6EnPV;
           h6EnPV = data;
           h6EnPV_valid = true;
+          memcpy(lastGoodMsg, currMsg, strlen(currMsg) + 1); // copy old message
 #if LORA == 1
           sendMQTT();
 #endif        
@@ -573,13 +660,14 @@ void handleRoot() {
 #else
   html += "<h1>test lora esp32p4</h1>";
 #endif  
-  html += String("<p>time: ") + timeString + String(", IP: ") + ip.toString()  + "</p>";
-  html += String("<p>cpu Frequency: ") + getCpuFrequencyMhz() + String(" MHz, Core: ") + xPortGetCoreID() +
-          String(", Internal Temp: ") + tempInt + String(" C</p>");
-  html += String("<p>uptime: ") + uptime + String(" seconds <br>  boot at: " + bootTimeStr + "</p>");
+  html += "<p>time: " + String(timeString) + ", IP: " + ip.toString()  + "</p>";
+  html += "<p>cpu Frequency: " + String(getCpuFrequencyMhz()) + " MHz, Core: " + String(xPortGetCoreID()) +
+          ", Internal Temp: " + String(tempInt) + " C</p>";
+  html += "<p>uptime: " + String(uptime) +" seconds <br>  boot at: " + String(bootTimeStr) + "</p>";
   //html += String("<p><ul><li>h6energy:   ") + String(h6EnPV.h6energy) + " Wh,  h6power: " + String(h6EnPV.h6power) + " W</li>";
   //html += String("<li>h6pvenergy: ") + String(h6EnPV.h6pvenergy) + " Wh,  h6pvpower: " + String(h6EnPV.h6pvpower) + " W</li>";
-  html += String("<li>cntLora: ") + cntLora + String(", lora invalid: ") + cntLoraInv + String(", loraErr: ") + cntLoraErr + "</li></ul>";
+  html += "<li>cntLora: " + String(cntLora) + ",  lora ok: " + String(cntLoraOk) + ",  lora invalid: " + String(cntLoraInv) + ",  loraErr: " + String(cntLoraErr) + ",  checksum error: " + String(cntLoraChecksum) + "</li></ul>";
+  html += "<p>lastError: " + String(lastError) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
 
   //html += String("<p><ul><li>bmeTem: ") + String(bmeTemp) + " C</li><li>bmeHum: " + String(bmeHum) + " %</li><li>bmePres: " + String(bmePres) + " hPa</li>";
   //html += String("<li>bmeGasRes: ") + String(bmeGasRes) + " kOhm</li>";
@@ -588,8 +676,8 @@ void handleRoot() {
   //html += "<p><table style=\"width: 80%; table-layout: fixed;\><colgroup><col style=\"width: 10%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"></colgroup>";
   html += "<p><table><colgroup><col style=\"width: 10%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"></colgroup>";
   html += "<tr><th>values</th><th style=\"white-space: nowrap;\">energy [Wh]</th><th style=\"white-space: nowrap;\">PVenergy [Wh]</th><th style=\"white-space: nowrap;\">power [W]</th><th style=\"white-space: nowrap;\">PVpower [W]</th><th style=\"white-space: nowrap;\">rssi [dBm]</th><th style=\"white-space: nowrap;\">snr [dB]</th></tr>";
-  html += String("<tr><td>prev</td><td>")+ String(h6EnPV_prev.h6energy)  + String("</td><td>") + String(h6EnPV_prev.h6pvenergy)  + String("</td><td>") + String(h6EnPV_prev.h6power) + String("</td><td>") + String(h6EnPV_prev.h6pvpower) + String("</td><td>") + String(h6EnPV_prev.rssi, 1) + String("</td><td>") + String(h6EnPV_prev.snr, 1) +String("</td></tr>");
-  html += String("<tr><td>curr</td><td>") + String(h6EnPV.h6energy)  + String("</td><td>") + String(h6EnPV.h6pvenergy)  + String("</td><td>") + String(h6EnPV.h6power) + String("</td><td>") + String(h6EnPV.h6pvpower) + String("</td><td>") + String(h6EnPV.rssi, 1) + String("</td><td>") + String(h6EnPV.snr, 1) +String("</td></tr>");
+  html += "<tr><td>prev</td><td>"+ String(h6EnPV_prev.h6energy)  + "</td><td>" + String(h6EnPV_prev.h6pvenergy)  + "</td><td>" + String(h6EnPV_prev.h6power) + "</td><td>" + String(h6EnPV_prev.h6pvpower) + "</td><td>" + String(h6EnPV_prev.rssi, 1) + "</td><td>" + String(h6EnPV_prev.snr, 1) + "</td></tr>";
+  html += "<tr><td>curr</td><td>" + String(h6EnPV.h6energy)  + "</td><td>" + String(h6EnPV.h6pvenergy)  + "</td><td>" + String(h6EnPV.h6power) + "</td><td>" + String(h6EnPV.h6pvpower) + "</td><td>" + String(h6EnPV.rssi, 1) + "</td><td>" + String(h6EnPV.snr, 1) + "</td></tr>";
   html += "</table></p>";
 
   //html += "<p><table><colgroup><col style=\"width: 12%;\"><col style=\"width: 20%;\"><col style=\"width: 20%;\"><col style=\"width: 20%;\"></colgroup>";
@@ -598,10 +686,10 @@ void handleRoot() {
   //html += String("<tr><td>buf2</td><td>") + tempBuf2  + String("</td><td>") + FloatRound(deltaBuf2*100, 1)  + String("</td><td>") + rawBuf2 + String("</td><td>") + cntBadBuf2 + String("</td><td>") + cntConsBadBuf2 + String("</td></tr>");
   //html += String("<tr><td>ww</td><td>") + tempWW  + String("</td><td>") + FloatRound(deltaWW*100, 1)  + String("</td><td>") + rawWW + String("</td><td>") + cntBadWW + String("</td><td>") + cntConsBadWW + String("</td></tr>");
   //html += "</table></p>";
-  html += String("<p>mqtt broker: ") + MQTT_BROKER + ", client: " + MQTT_CLIENT_ID + ", topic: " + mqttTopicBufferTemp  +
-          "<br>Last Published: " + mqttLastPublishDate + ", connected: " + mqttConnected + "</p>";
-  html += String("<p><ul><li>mqtt pubs: ") + cntMPub + "</li><li>mqtt errors: " + cntMPubErr + "</li><li>mqtt reconnects: " + cntMReCon + 
-          "</li><li>mqtt disconnects: " + cntMDisCon + "</li>";
+  html += "<p>mqtt broker: " + String(MQTT_BROKER) + ", client: " + String(MQTT_CLIENT_ID) + ", topic: " + String(mqttTopicBufferTemp)  +
+          "<br>Last Published: " + String(mqttLastPublishDate) + ", connected: " + String(mqttConnected) + "</p>";
+  html += "<p><ul><li>mqtt pubs: " + String(cntMPub) + "</li><li>mqtt errors: " + String(cntMPubErr) + "</li><li>mqtt reconnects: " + String(cntMReCon) + 
+          "</li><li>mqtt disconnects: " + String(cntMDisCon) + "</li>";
   //html += "<li>WiFi reconnects: " + cntWifiReConn + "</li>";
   html += "</ul></p>";
   html += "<p><a href=\"/info\">info</a> <a href=\"/ota\">ota</a> </p>";        
@@ -615,8 +703,8 @@ void handleInfo() {
   html += "<head><title>ESP32P4 lora info</title></head><body>";
   html += "<h1>hw info</h1> <ul> <li>esp32 p4 waveshare dev board</li> <li>lora SX1262 HF core board</li> </ul>";
   html += "<h1>sw info</h1> <ul> <li>arduino ide 2.3.7</li> <li>espressif 3.x</li> <li>RadioLib 7.5</li> </ul>";
-  html += "<p> to build update, in arduino, Sketch, Export Compiled Binary, upload the esp32_voc_http_mqtt_ntp.ino.bin file";
-  html += String("<p>") + VERSION + "</p>";
+  html += "<p> to build OTA update, in Arduino IDE, Menu Sketch, Export Compiled Binary, upload the esp32p4_eth_http_mqtt_ntp.ino.bin file";
+  html += "<p>" + String(VERSION) + "</p>";
   html += "<p><a href=\"/\">Back to Home</a></p>";
   html += "</body></html>";
 
@@ -691,11 +779,17 @@ void handleFirmwareUpload() {
 
 void handleUpdate() {
   Serial.println("handleUpdate()");
-  if (!checkAuthentication()) return;
+  //if (!checkAuthentication()) return;
   server.sendHeader("Connection", "close");
   server.send(200, "text/html", "<h1>Update Success! Rebooting...</h1>");
   delay(1000);
   ESP.restart();
+}
+
+void handleReset() {
+  server.send(200, "text/html", "<p>ESP32 restarting...</p>");
+  delay(2000);          // short delay to ensure client gets the response
+  ESP.restart();       // trigger ESP32 reboot
 }
 
 /////////////////////////////////
@@ -809,6 +903,8 @@ void setup() {
   //server.on("/testled", handleTestLED);
   server.on("/ota", handleOTAUpdatePage);
   server.on("/update", HTTP_POST, handleUpdate, handleFirmwareUpload);
+  server.on("/reset", handleReset);
+
   /*
   server.on("/led", HTTP_GET, []() {
     server.send(200, "text/plain", "LED test starting");
@@ -818,16 +914,21 @@ void setup() {
   server.begin();
   Serial.printf("HTTP web server started\n");
 
+#if NTP == 1
   while (!getLocalTime(&timeinfo)) {
     Serial.println("Waiting for NTP time...");
     delay(500);
   }
+#endif
+
   strftime(upTimeBuf, sizeof(upTimeBuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
   bootTimeStr = String(upTimeBuf);
 
-  // connect to mqtt move to back to allow web server to connect
+#if MQTTenable == 1
   mqtt.begin(MQTT_BROKER, MQTT_PORT, network);
   connectMQTT();
+#endif
+
 }
 
 void loop() {
@@ -844,4 +945,19 @@ radio.setCodingRate(5);          // 5-8 (higher = more error correction)
 radio.setOutputPower(14);        // TX power in dBm (max 22 dBm for SX1262)
 radio.setSyncWord(0x12);         // Private networks use 0x12, LoRaWAN uses 0x34
 radio.setPreambleLength(8);      // Preamble length
+*/
+
+/*
+up in attic
+values	energy [Wh]	PVenergy [Wh]	power [W]	PVpower [W]	rssi [dBm]	snr [dB]
+prev	1874535	1358149	111	1	-105.00	-0.75
+curr	1874539	1358149	109	2	-106.00	-2.50
+
+at dev pc
+LoRa packet received: 12 bytes
+Raw data: 00 1C 9A 45 00 40 00 14 B9 44 00 04 
+h6energy:   1874501 Wh  h6power:    64 W
+h6pvenergy: 1358148 Wh  h6pvpower:  4 W
+RSSI: -109.0 dBm, SNR: -11.2 dB
+2026-01-12 16:00:45  sent MQTT, topic: iot/power/h6/status, payload: {"timestamp":"2026-01-12 16:00:45","h6energy":1874501,"h6power":64,"h6pvenergy":1358148,"h6pvpower":4,"rssi":-109,"snr":-11.25}
 */
