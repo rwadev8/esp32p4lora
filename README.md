@@ -31,6 +31,11 @@ at the same location as the shelly lora addon reciever, here is a comparison, ro
 
 time will tell how stable this is, and how much additional data filtering i have to add to the HA sensors where the data are consumed.
 
+## invalid data
+the hope was that the better signal, which did not always hold true, would remove the data spikes. but the hope was unfounded it seems. but i did notice and fix a problem with floating virtual compoment values and forced them to int when sending the lora data.
+Also added a simple checksum to detect simple bit errors.
+
+
 ## notes
 - do NOT run the lora rcv task on core 0, you will get errors
   
