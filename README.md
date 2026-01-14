@@ -26,7 +26,8 @@ the sx1262 on an esp32s3 board and lora worked without problems, and then move t
 at the same location as the shelly lora addon reciever, here is a comparison, rough values, off course they fluctuate, but def. a lot better
 
 - shelly add on   RSSI: -118 dBm, SNR: -11 dB
-- esp32 p4 setup: RSSI: -105 dBm, SNR: -1,5 dB
+- esp32 p4 setup: RSSI: -105 dBm, SNR: -1,5 dB    
+  but alas, have since now see values as bad as -121 dBm and -15 dB when it was very foggy outside
 
 time will tell how stable this is, and how much additional data filtering i have to add to the HA sensors where the data are consumed.
 
