@@ -10,6 +10,7 @@
 // 3.0.2 integrate sx1262 lora module, seems to only work on p4 dev, not the waveshare nano board
 // 3.0.5 add DEFINE for MQTT, in debug set LAN and MQTT to 0 and LORA to 1 to be able to just test LORA
 // 3.0.6 add /reset page, print lora msg as hex
+// 3.0.8 add mqtt last will / availablity
 
 #define PROD 1 //  REMEMBER to change to 1 for prod deploy
 
@@ -36,7 +37,7 @@
 #define BUFLEN 64
 #define ERRBUFLEN 265
 
-const char VERSION[] = "v3.0.6";
+const char VERSION[] = "v3.0.8";
 char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
@@ -260,6 +261,10 @@ void logError(const char *fmt, ...) {
 
   // Optionally also print to Serial
   Serial.printf("%s\n", lastError);
+}
+
+void clearLastError() {
+    lastError[0] = '\0';  // reset
 }
 
 ////////////////////////////
@@ -497,6 +502,7 @@ void LoraReceiveTask(void* parameter) {
           h6EnPV = data;
           h6EnPV_valid = true;
           memcpy(lastGoodMsg, currMsg, strlen(currMsg) + 1); // copy old message
+          clearLastError();
 #if LORA == 1
           sendMQTT();
 #endif        
@@ -571,12 +577,15 @@ void connectMQTT() {
   // Connect to the MQTT broker
   //mqtt.begin(MQTT_BROKER, MQTT_PORT, network); // move to setup to be able to use this call for reconnects
 
+  mqtt.setKeepAlive(180);  // set mqtt keepalive
+  mqtt.setWill("iot/power/h6/availability", "offline", true, 1); // generate an availability feature for the HA sensors
+
   Serial.printf("Connecting to MQTT broker %s:%d\n", MQTT_BROKER, MQTT_PORT);
   
   while (!mqtt.connect(MQTT_CLIENT_ID)) {
     //ledColor.g = 255; ledColor.b = 255;
     Serial.print("!m");
-    delay(250);
+    //delay(250);
     //ledColor.g = 0;  ledColor.b = 0;
     delay(500);
     cntMDisCon++;
@@ -586,6 +595,7 @@ void connectMQTT() {
       Serial.println("MQTT Connection failed");
       return;
   }
+  mqtt.publish("iot/power/h6/availability", "online", true, 1);
   cntMReCon++;
 }
 
@@ -603,6 +613,7 @@ void sendMQTT() {
   message["h6pvpower"] = h6EnPV.h6pvpower;
   message["rssi"] = h6EnPV.rssi;
   message["snr"] = h6EnPV.snr;
+  message["checksumErr"] = cntLoraChecksum;
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
 
