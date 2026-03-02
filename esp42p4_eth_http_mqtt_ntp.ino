@@ -416,7 +416,7 @@ void PostMQTT(void * parameter) {
 #if LORA != 1      
     if(millis() - mqttPublishTime > mqttPubInt) {
 #if sendMQTT == 1      
-      sendMQTT();
+      sendMQTTTemp();
 #endif      
       mqttPublishTime = millis();
     }
@@ -619,8 +619,7 @@ void connectMQTT() {
   //mqtt.begin(MQTT_BROKER, MQTT_PORT, network); // move to setup to be able to use this call for reconnects
 
   mqtt.setKeepAlive(180);  // set mqtt keepalive
-  mqtt.setWill("iot/power/h6/availability", "offline", true, 1); // generate an availability feature for the HA sensors
-
+ 
   Serial.printf("Connecting to MQTT broker %s:%d\n", MQTT_BROKER, MQTT_PORT);
   
   while (!mqtt.connect(MQTT_CLIENT_ID)) {
@@ -1063,6 +1062,7 @@ void setup() {
   bootTimeStr = String(upTimeBuf);
 
 #if MQTTenable == 1
+  mqtt.setWill("iot/power/h6/availability", "offline", true, 1); // generate an availability feature for the HA sensors
   mqtt.begin(MQTT_BROKER, MQTT_PORT, network);
   connectMQTT();
 #endif
@@ -1085,17 +1085,6 @@ radio.setSyncWord(0x12);         // Private networks use 0x12, LoRaWAN uses 0x34
 radio.setPreambleLength(8);      // Preamble length
 */
 
-/*
-up in attic
-values	energy [Wh]	PVenergy [Wh]	power [W]	PVpower [W]	rssi [dBm]	snr [dB]
-prev	1874535	1358149	111	1	-105.00	-0.75
-curr	1874539	1358149	109	2	-106.00	-2.50
-
-at dev pc
-LoRa packet received: 12 bytes
-Raw data: 00 1C 9A 45 00 40 00 14 B9 44 00 04 
-h6energy:   1874501 Wh  h6power:    64 W
-h6pvenergy: 1358148 Wh  h6pvpower:  4 W
 RSSI: -109.0 dBm, SNR: -11.2 dB
 2026-01-12 16:00:45  sent MQTT, topic: iot/power/h6/status, payload: {"timestamp":"2026-01-12 16:00:45","h6energy":1874501,"h6power":64,"h6pvenergy":1358148,"h6pvpower":4,"rssi":-109,"snr":-11.25}
 */
