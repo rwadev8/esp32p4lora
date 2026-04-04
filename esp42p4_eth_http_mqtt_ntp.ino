@@ -1,17 +1,3 @@
-// get temp from MAX6675 for buffer and warm water tanks
-// 1.0.3 filter bad values, deal with inital value problem
-// 1.0.4 add buf2
-// 1.1.0 ota update feature
-// 1.2.0 add on board led color info, solder first!!, add wifi reconnect and check mqtt publish error
-// 2.0.0a copy of the esp32_temp to test bme688
-// 2.1.0 using bosch library
-// 3.0 p4 eth
-// 3.0.1 add wifi back in and enable wifi at compile time
-// 3.0.2 integrate sx1262 lora module, seems to only work on p4 dev, not the waveshare nano board
-// 3.0.5 add DEFINE for MQTT, in debug set LAN and MQTT to 0 and LORA to 1 to be able to just test LORA
-// 3.0.6 add /reset page, print lora msg as hex
-// 3.0.8 add mqtt last will / availablity
-// 3.1.0 split lora data and status, merge in some changes from esp32p4 compile switches 
 
 #define PROD 1 //  REMEMBER to change to 1 for prod deploy
 
@@ -35,11 +21,26 @@
 #define MQTTenable 1 // set to 0 for debug
 #define NTP 1
 #define NEOPIXEL 0
+#define LOG_SERIAL 0
+#define LOG_WEB 1
+#define LOG_BOTH 2
+#define LOG_MODE LOG_WEB // define log mode
 
 #define BUFLEN 64
 #define ERRBUFLEN 265
+#define LOG_LINES 800
+#define LOG_LINE_LEN 200
+char logBuffer[LOG_LINES][LOG_LINE_LEN];
+int logHead = 0;
 
-const char VERSION[] = "v3.1.1";
+#if PROD == 1
+bool debugMode = false;  // global
+#else
+bool debugMode = true;  // global
+#endif
+#define logDbg(fmt, ...) if (debugMode) logMsg(fmt, ##__VA_ARGS__)
+
+const char VERSION[] = "v3.2.2";
 char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
@@ -68,6 +69,8 @@ char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 Module mod(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 SX1262 radio(&mod);
+SemaphoreHandle_t loraMutex = xSemaphoreCreateMutex();
+volatile bool loraRcvFlag = false;
 
 // Set web server port number to 80
 WebServer server(80);
@@ -90,6 +93,8 @@ int mqttPubInt = 30 * 1000;
 #else
   const char mqttTopic[] = "iot/power/h6test"; 
 #endif
+const char mqttCmd[] = "cmd";
+char mqttCmdTopic[BUFLEN];
 
 unsigned long mqttPublishTime = 0;
 struct tm mqttTimeInfo;
@@ -98,6 +103,7 @@ int cntMReCon = 0;
 int cntMDisCon = 0;
 int cntMPub = 0;
 int cntMPubErr = 0;
+int cntMRcv = 0;
 int cntWifiReConn = 0;
 int cntBadBme = 0;
 int cntBme = 0;
@@ -107,6 +113,7 @@ int cntLoraOk = 0;
 int cntLoraErr = 0;
 int cntLoraInv = 0;
 int cntLoraChecksum = 0;
+int cntLoraSnd = 0;
 
 const int initTemp = 15.0;
 
@@ -151,12 +158,27 @@ TaskHandle_t TWatchDog;
 // h6 lora
 char currMsg[BUFLEN * 3 + 1];
 char lastGoodMsg[BUFLEN * 3 + 1];
+int loraLastRcvErr = 0;
+int loraLastSndErr = 0;
 
-struct ShellyData {
-  uint32_t h6energy;    // Wh
-  int16_t h6power;      // W (can be negative)
-  uint32_t h6pvenergy;  // Wh
-  int16_t h6pvpower;    // W (can be negative)
+// structure for the lora messages,
+struct ShellyPWEN {
+  uint32_t energy;    // Wh
+  int16_t power;      // W (can be negative)
+  uint32_t pvEnergy;  // Wh
+  int16_t pvPower;    // W (can be negative)
+};
+
+struct ShellyENEXP {
+    uint32_t exportEnergy;
+};
+
+struct ShellyHEALTH {
+    uint32_t uptime;
+    int8_t   tempC;
+    int8_t   wifiRssi;
+    uint8_t  wifiStatus;
+
 };
 
 struct LoraStatus {
@@ -172,11 +194,34 @@ struct HeatTemp {
 };
 
 HeatTemp bufTemp;
-ShellyData h6EnPV;
-ShellyData h6EnPV_prev;
-bool h6EnPV_valid = false;
+ShellyPWEN h6PwEn;
+ShellyPWEN h6PwEn_prev;
+ShellyENEXP h6EnExp;
+ShellyHEALTH h6Health;
+bool h6PwEn_valid = false;
+bool h6EnExp_valid  = false;
+bool h6Health_valid = false;
 LoraStatus loraStatus;
 LoraStatus loraStatus_prev;
+
+enum class LoraTel : uint8_t {
+    // for now use hamming distance >=2 since we do not use a checksum ehre
+    H6_PWEN         = 0x11,  // periodic power and energy data
+    H6_ENEXP        = 0x22,  // energy export data
+    H6_HEALTH       = 0x33,  // health status data, wlan, ha
+    GET_H6_ENEXP    = 0xaa,  // request energy export data
+    GET_H6_HEALTH   = 0xbb,  // request health data
+    SET_ESP_DBGOFF  = 0xf0,  // disable debug logging
+    SET_ESP_DBGON   = 0xf1  // enable debug logging
+};
+
+enum class WifiStatus : uint8_t {
+    GOT_IP       = 0,
+    CONNECTED    = 1,
+    CONNECTING   = 2,
+    DISCONNECTED = 3,
+    UNKNOWN      = 15
+};
 
 // ntp
 const long  gmtOffset_sec = 3600;
@@ -215,12 +260,12 @@ const char* updatePage = R"rawliteral(
 // helper functions
 
 // round to digits, standard round() returns integer here
-float FloatRound(float value, int digits) {
+float floatRound(float value, int digits) {
   return round(value * 10.0 * digits) / 10.0 * digits;
 }
 
 // caluclate temp delta, deal with 0 C issue, suggested by ChatGPT
-float CalcDelta(float curTemp, float temp, float eps) {
+float calcDelta(float curTemp, float temp, float eps) {
   float deltaPerc = 0;
   const float maxPercDelta = 50.0; // max allowed change bound
 
@@ -232,8 +277,6 @@ float CalcDelta(float curTemp, float temp, float eps) {
   }
   return deltaPerc;
 }
-
-
 
 uint32_t bytesToUint32(uint8_t* bytes, int offset) {
   return ((uint32_t)bytes[offset] << 24) |
@@ -285,6 +328,34 @@ void clearLastError() {
     lastError[0] = '\0';  // reset
 }
 
+void logMsg(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    
+    #if LOG_MODE == LOG_WEB || LOG_MODE == LOG_BOTH
+        vsnprintf(logBuffer[logHead], LOG_LINE_LEN, fmt, args);
+        logHead = (logHead + 1) % LOG_LINES;
+    #endif
+    
+    #if LOG_MODE == LOG_SERIAL || LOG_MODE == LOG_BOTH
+        vprintf(fmt, args);
+        printf("\n");
+    #endif
+    
+    va_end(args);
+}
+
+const char* wifiStatusToStr(uint8_t s) {
+    switch(s) {
+        case (uint8_t)WifiStatus::GOT_IP:       return "got ip";
+        case (uint8_t)WifiStatus::CONNECTED:    return "connected";
+        case (uint8_t)WifiStatus::CONNECTING:   return "connecting";
+        case (uint8_t)WifiStatus::DISCONNECTED: return "disconnected";
+        case (uint8_t)WifiStatus::UNKNOWN:      return "unknown";
+        default:                                return "???";
+    }
+}
+
 ////////////////////////////
 
 uint8_t calculateXorChecksum(uint8_t* data, size_t len) {
@@ -310,82 +381,145 @@ uint8_t calculateCrc8(uint8_t* data, size_t len) {
     return crc;
 }
 
-bool parseLoraPayload(uint8_t* data, size_t len, ShellyData* result) {
-  if (len != 13) {  // Changed from 12 to 13
-    logError("Warning: Unexpected payload length: %d bytes (expected 13)\n", len);
+bool parsePwEn(uint8_t* data, size_t len, ShellyPWEN* result) {
+  int telLen = 14;
+  if (len != telLen) {  // Changed from 12 to 13
+    logMsg(" WARN: unexpected payload health length: %d bytes (expected %d)\n", len, telLen);
     return false;
   }
   
   // Verify checksum
-  uint8_t receivedChecksum = data[12];
-  //uint8_t calculatedChecksum = calculateXorChecksum(data, 12);
-  uint8_t calculatedChecksum = calculateCrc8(data, 12);
+  uint8_t receivedChecksum = data[telLen-1];
+  uint8_t calculatedChecksum = calculateCrc8(data, telLen-1);
   
   if (receivedChecksum != calculatedChecksum) {
     cntLoraChecksum++;
-    logError("Checksum failed! Received: 0x%02X, Calculated: 0x%02X\n", 
+    logMsg("ERR checksum failed! Received: 0x%02X, Calculated: 0x%02X\n", 
                   receivedChecksum, calculatedChecksum);
     return false;
   }
   
-  // Parse data (same as before)
-  result->h6energy = bytesToUint32(data, 0);
-  result->h6power = bytesToInt16(data, 4);
-  result->h6pvenergy = bytesToUint32(data, 6);
-  result->h6pvpower = bytesToInt16(data, 10);
+  // assign to target structure
+  result->energy = bytesToUint32(data, 1);
+  result->power = bytesToInt16(data, 5);
+  result->pvEnergy = bytesToUint32(data, 7);
+  result->pvPower = bytesToInt16(data, 11);
   
   return true;
 }
 
-void printShellyData(const ShellyData& data) {
-  //Serial.println("\n=== Shelly Data Received ===");
-  Serial.printf("h6energy:   %u Wh  h6power:    %d W\n", data.h6energy, data.h6power);
-  Serial.printf("h6pvenergy: %u Wh  h6pvpower:  %d W\n", data.h6pvenergy, data.h6pvpower);
+bool parseEnExp(uint8_t* data, size_t len, ShellyENEXP* result) {
+  int telLen = 6;
+  if (len != telLen) {  
+    logMsg(" WARN: unexpected payload health length: %d bytes (expected %d)\n", len, telLen);
+    return false;
+  }
+  
+  // Verify checksum
+  uint8_t receivedChecksum = data[telLen-1];
+  uint8_t calculatedChecksum = calculateCrc8(data, telLen-1);
+  
+  if (receivedChecksum != calculatedChecksum) {
+    cntLoraChecksum++;
+    logMsg("ERR checksum failed! rcv: 0x%02X, calc: 0x%02X\n", receivedChecksum, calculatedChecksum);
+    return false;
+  }
+  
+  // assign to target structure
+  result->exportEnergy = bytesToUint32(data, 1);
+  
+  return true;
+}
+
+
+bool parseHealth(uint8_t* data, size_t len, ShellyHEALTH* result) {
+  int telLen = 9;
+  if (len != telLen) {  
+    logMsg(" WARN: unexpected payload health length: %d bytes (expected %d)\n", len, telLen);
+    return false;
+  }
+  
+  // Verify checksum
+  uint8_t receivedChecksum = data[telLen-1];
+  uint8_t calculatedChecksum = calculateCrc8(data, telLen-1);
+  
+  if (receivedChecksum != calculatedChecksum) {
+    cntLoraChecksum++;
+    logMsg("ERR checksum failed! rcv: 0x%02X, calc: 0x%02X\n", receivedChecksum, calculatedChecksum);
+    return false;
+  }
+  
+  // assign to target structure
+  result->uptime = bytesToUint32(data, 1);
+  uint8_t loraTemp = data[5];
+  int8_t temp = (int8_t)loraTemp; // cast reinterprets the bits as signed, undoes the +256 in encode for negative numbers
+  result->tempC = temp; 
+  result->wifiRssi = data[6];
+  result->wifiStatus = data[7];
+  
+  return true;
+}
+
+
+void printPwEnData(const ShellyPWEN& data) {
+  logDbg(" energy:  %u Wh  power:  %d W,   pvEnergy:  %u Wh  pvPower:  %d W", data.energy, data.power, data.pvEnergy, data.pvPower);
+}
+
+void printEnExpData(const ShellyENEXP& data) {
+  logDbg(" h6ExpEnergy:  %u Wh", data.exportEnergy);
+}
+
+void printHealthData(const ShellyHEALTH& data) {
+    uint32_t uptime = data.uptime;
+    uint32_t days   = uptime / 86400;
+    uint32_t hours  = (uptime % 86400) / 3600;
+    uint32_t mins   = (uptime % 3600) / 60;
+    logDbg(" uptime: %ud %02uh %02um, temp: %d C, wifi rssi %d dBm, wifi status: %s", days, hours, mins, data.tempC, data.wifiRssi, wifiStatusToStr(data.wifiStatus));
 }
 
 // Validation function
-bool validateShellyData(const ShellyData& current, const ShellyData& previous, bool hasPrevious) {
+bool validatePwEnData(const ShellyPWEN& current, const ShellyPWEN& previous, bool hasPrevious) {
   // Check pvpower range (0 to 950W)
-  if (current.h6pvpower < 0 || current.h6pvpower > 950) {
-    logError("  WARN  pvpower %d out of range [0, 950]\n", current.h6pvpower);
+  if (current.pvPower < 0 || current.pvPower > 950) {
+    logMsg("  WARN  pvpower %d out of range [0, 950]\n", current.pvPower);
     return false;
   }
   
   // Check house power range (example: -10000 to 32000W)
-  if (current.h6power < -950 || current.h6power > 5000) {
-    logError("  WARN  power %d out of range\n", current.h6power);
+  if (current.power < -950 || current.power > 5000) {
+    logMsg("  WARN  power %d out of range\n", current.power);
     return false;
   }
 
   // Only check jumps if we have previous data
   if (hasPrevious) {
     // coarse check energy data
-    if (current.h6energy < previous.h6energy) {
-      logError("  WARN: energy decreased to %d from %d\n", current.h6energy, previous.h6energy);
+    if (current.energy < previous.energy) {
+      logMsg("  WARN: energy decreased to %d from %d\n", current.energy, previous.energy);
       return false;
     }
-    if (current.h6pvenergy < previous.h6pvenergy) {
-      logError("  WARN: pv energy decreased to %d from %d\n", current.h6pvenergy, previous.h6pvenergy);
+    if (current.pvEnergy < previous.pvEnergy) {
+      logMsg("  WARN: pv energy decreased to %d from %d\n", current.pvEnergy, previous.pvEnergy);
       return false;
     }
 
     // Check for upward energy jump > 1% 
     // bug cntLora != 2 && does not allow for errors and the switch to good data after the second packet
-    if (current.h6energy > previous.h6energy && previous.h6energy > 0) {
-      float increasePercent = ((float)(current.h6energy - previous.h6energy) / previous.h6energy) * 100.0;
+    if (current.energy > previous.energy && previous.energy > 0) {
+      float increasePercent = ((float)(current.energy - previous.energy) / previous.energy) * 100.0;
       if (increasePercent > 1.0) {
-        logError("Validation failed: h6energy increased by %.2f%% (%u -> %u Wh)\n", 
-                      increasePercent, previous.h6energy, current.h6energy);
+        logMsg(" ERR validation failed: energy increased by %.2f%% (%u -> %u Wh)\n", 
+                      increasePercent, previous.energy, current.energy);
         return false;
       }
     }
     
     // Check for upward PV energy jump > 1%
-    if (current.h6pvenergy > previous.h6pvenergy && previous.h6pvenergy > 0) {
-      float pvIncreasePercent = ((float)(current.h6pvenergy - previous.h6pvenergy) / previous.h6pvenergy) * 100.0;
+    if (current.pvEnergy > previous.pvEnergy && previous.pvEnergy > 0) {
+      float pvIncreasePercent = ((float)(current.pvEnergy - previous.pvEnergy) / previous.pvEnergy) * 100.0;
       if (pvIncreasePercent > 1.0) {
-        logError("Validation failed: h6pvenergy increased by %.2f%% (%u -> %u Wh)\n", 
-                      pvIncreasePercent, previous.h6pvenergy, current.h6pvenergy);
+        logMsg(" ERR validation failed: pvEnergy increased by %.2f%% (%u -> %u Wh)\n", 
+                      pvIncreasePercent, previous.pvEnergy, current.pvEnergy);
         return false;
       }
     }
@@ -396,6 +530,10 @@ bool validateShellyData(const ShellyData& current, const ShellyData& previous, b
 
 /////////////////////////////////////////////////
 // tasks
+
+IRAM_ATTR void setFlag(void) {
+    loraRcvFlag = true;
+}
      
 void PostMQTT(void * parameter) {
   // at startup wait a few seconds to allow connections to stablize
@@ -466,23 +604,22 @@ void WifiCheckReconn(void * parameter) {
 void onEthEvent(arduino_event_id_t event) {
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
-      Serial.println("ETH Started");
+      logMsg("eth started");
       ETH.setHostname("esp32-p4-device");
       break;
       
     case ARDUINO_EVENT_ETH_CONNECTED:
-      Serial.println("ETH Connected");
+      logMsg("eth connected");
       break;
       
     case ARDUINO_EVENT_ETH_GOT_IP:
       ip = ETH.localIP();
-      Serial.printf("Ethernet connected, IP: %d.%d.%d.%d\n", 
-                    ip[0], ip[1], ip[2], ip[3]);
+      logMsg("eth got ip, ip: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
       eth_connected = true;
       break;
       
     case ARDUINO_EVENT_ETH_DISCONNECTED:
-      Serial.println("ETH Disconnected");
+      Serial.println("eth disconnected");
       eth_connected = false;
       break;
   }
@@ -506,61 +643,108 @@ void WatchDog(void * parameter) {
 }
 
 void LoraReceiveTask(void* parameter) {
-  uint8_t buffer[BUFLEN];
+  uint8_t buffer[BUFLEN] = {0};  // zero initialised;
   Serial.println("LoRa receive task started");
   
   for(;;) {
-    // Set a short timeout for receive (e.g., 1 second)
-    radio.setDio1Action(NULL);  // Disable interrupt
-    int state = radio.receive(buffer, BUFLEN);
+    if(loraRcvFlag) {
+      loraRcvFlag = false;
     
-    if (state == RADIOLIB_ERR_NONE) {
-      cntLora++;
-      size_t len = radio.getPacketLength();
-      bufferToHex(buffer, len, currMsg, BUFLEN);
-      Serial.printf("LoRa packet received: %d bytes\n", len);
-      
-      Serial.print("Raw data: ");
-      for (size_t i = 0; i < len; i++) {
-        Serial.printf("%02X ", buffer[i]);
-      }
-      Serial.println();
-      
-      ShellyData data;
-      if (parseLoraPayload(buffer, len, &data)) {
-        printShellyData(data);
-        if (validateShellyData(data, h6EnPV_prev, h6EnPV_valid)) {
-          // Data is good - update global and save as previous
-          cntLoraOk++;
-          h6EnPV_prev = h6EnPV;
-          h6EnPV = data;
-          h6EnPV_valid = true;
-          memcpy(lastGoodMsg, currMsg, strlen(currMsg) + 1); // copy old message
-          clearLastError();
-#if MQTTenable == 1
-          sendMQTTLoraData();
-#endif        
-        } else {
-          cntLoraInv++;
-          Serial.println("Data validation failed - ignoring packet");
-        }
-        loraStatus_prev = loraStatus;
-        loraStatus.rssi = radio.getRSSI();
-        loraStatus.snr = radio.getSNR();
-        loraStatus.cntCSerr = cntLoraChecksum;
-#if MQTTenable == 1
-        sendMQTTLoraStatus();
-#endif       
-        
+      if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
+        size_t len = radio.getPacketLength(true);
+        //logDbg("lora rcv raw packet len: %d", len);
+        //if (len == 0) len = BUFLEN; // if len is 0, fall back to BUFLEN first claude suggestion
+        if (len == 0) {
+            logDbg("zero length packet, ignoring");
+            radio.startReceive();
+            xSemaphoreGive(loraMutex);
+            continue;  // skip to next iteration of for(;;)
+        }        
+        int status  = radio.readData(buffer, len);
+        float rssi = radio.getRSSI();
+        float snr  = radio.getSNR();
+        radio.startReceive();  // back to receive immediately
+        xSemaphoreGive(loraMutex);
 
-      }
-      
-    } else if (state == RADIOLIB_ERR_RX_TIMEOUT) {
-      // Normal timeout - no packet received
-    } else {
-      Serial.printf("[SX1262] Receive error: %d\n", state);
-      cntLoraErr++;
-    }
+        if (status == RADIOLIB_ERR_NONE) {
+          cntLora++;
+          bufferToHex(buffer, len, currMsg, BUFLEN);
+          logMsg("lora rcv: %d bytes,  tel: %02x,  rssi: %.1f dBm, snr: %.1f dB", len, buffer[0], rssi, snr);
+          logMsg("raw data: %s", currMsg);
+
+          uint8_t telType = buffer[0];
+          switch (static_cast<LoraTel>(telType)) {
+              case LoraTel::H6_PWEN:
+                  ShellyPWEN data;
+                  if (parsePwEn(buffer, len, &data)) {
+                      h6PwEn_valid = true;
+                      printPwEnData(data);
+                      if (validatePwEnData(data, h6PwEn_prev, h6PwEn_valid)) {
+                        // Data is good - update global and save as previous
+                        cntLoraOk++;
+                        h6PwEn_prev = h6PwEn;
+                        h6PwEn = data;
+                        h6PwEn_valid = true;
+                        memcpy(lastGoodMsg, currMsg, strlen(currMsg) + 1); // copy old message
+#if MQTTenable == 1
+                      mqttPubLoraPwEn();
+#endif
+                      }
+                      else {
+                        cntLoraInv++;
+                        logMsg("data validation failed - ignoring packet, rssi: %.1f dBm, snr: %.1f dB", rssi, snr);
+                      }
+                  }
+                  break;
+
+              case LoraTel::H6_ENEXP:
+                  if (parseEnExp(buffer, len, &h6EnExp)) {
+                      h6EnExp_valid = true;
+                      printEnExpData(h6EnExp);
+#if MQTTenable == 1
+                      mqttPubLoraEnExp();
+#endif
+                  }
+                  break;
+
+              case LoraTel::H6_HEALTH:
+                  if (parseHealth(buffer, len, &h6Health)) {
+                      h6Health_valid = true;
+                      printHealthData(h6Health);
+#if MQTTenable == 1
+                      mqttPubLoraHealth();
+#endif
+                  }
+                  break;
+
+              // outgoing requests — ignore silently, not an error
+              case LoraTel::GET_H6_ENEXP:
+              case LoraTel::GET_H6_HEALTH:
+                  logDbg("ignoring own request echo: 0x%02X", telType);
+                  break;
+              default:
+                  logMsg("unknown tel type: 0x%02X, ignoring", telType);
+                  break;
+          }      
+
+          loraStatus_prev = loraStatus;
+          loraStatus.rssi = rssi;
+          loraStatus.snr = snr;
+          loraStatus.cntCSerr = cntLoraChecksum;
+#if MQTTenable == 1
+          mqttPubLoraStatus();
+#endif    
+        }   
+        else if (status == RADIOLIB_ERR_RX_TIMEOUT) {
+          // Normal timeout - no packet received
+        } 
+        else {
+          logMsg("[SX1262] receive error: %d\n", status);
+          cntLoraErr++;
+          loraLastRcvErr = status;
+        }
+      } // if (xSemaphoreTake
+    }  // loraRcvFlag  
     
     // CRITICAL: Always yield to prevent watchdog
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -593,7 +777,7 @@ bool initLoRa() {
   int state = radio.begin(867.125);
   
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("success!");
+    logMsg("lora radio.begin ok");
     
     // Configure RF switches
     radio.setRfSwitchPins(LORA_RXEN, LORA_TXEN);
@@ -604,10 +788,11 @@ bool initLoRa() {
     radio.setCodingRate(5);
     radio.setOutputPower(22);
     
-    Serial.println("LoRa config ok");
+    logMsg("lora config ok");
     return true;
-  } else {
-    Serial.printf("LoRa init failed, code: %d\n", state);
+  } 
+  else {
+    logMsg("ERR lora init failed, code: %d\n", state);
     return false;
   }
 }
@@ -620,7 +805,7 @@ void connectMQTT() {
 
   mqtt.setKeepAlive(180);  // set mqtt keepalive
  
-  Serial.printf("Connecting to MQTT broker %s:%d\n", MQTT_BROKER, MQTT_PORT);
+  logMsg("connecting to mqtt broker %s:%d", MQTT_BROKER, MQTT_PORT);
   
   while (!mqtt.connect(MQTT_CLIENT_ID)) {
     //ledColor.g = 255; ledColor.b = 255;
@@ -632,14 +817,20 @@ void connectMQTT() {
   }
 
   if (!mqtt.connected()) {
-      Serial.println("MQTT Connection failed");
+      logMsg("ERR MQTT Connection failed");
       return;
   }
+  //last will
   mqtt.publish("iot/power/h6/availability", "online", true, 1);
+  // subscriptions
+  char subTopic[64];
+  snprintf(subTopic, sizeof(subTopic), "%s/%s", mqttTopic, mqttCmd);
+  mqtt.subscribe(subTopic);
+  logMsg("subscribed to: %s", subTopic);
   cntMReCon++;
 }
 
-void sendMQTTTemp() {
+void mqttPubTempData() {
   bool published;
   StaticJsonDocument<200> message;
   char topic[128];
@@ -660,35 +851,77 @@ void sendMQTTTemp() {
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
     ledColor.g = 255;
-    Serial.printf("%s  mqtt pub temp, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    logDbg("%s  mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
     delay(200);
     ledColor.g = 0;
   }
   else {
     ledColor.g = 255;   ledColor.b = 255;
-    Serial.printf("%s  ERROR mqtt pub temp, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    logMsg("%s  ERROR mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
     delay(500);
     ledColor.g = 0;   ledColor.b = 0;
   }
 }
 
-void sendMQTTLoraData() {
+void rcvMqttMessage(String &topic, String &payload) {
+    // convert once, work with c-strings avoid head problems
+    //const char* tpc = topic.c_str();
+    //char cmdTopic[64];
+    //snprintf(cmdTopic, sizeof(cmdTopic), "%s/cmd", mqttTopic);
+    //if (strcmp(tpc, cmdTopic) == 0)   handleMqttRcv(payload);
+  String payload_log = payload; // copy
+  payload_log.replace("\n", " ");
+  payload_log.replace("\r", " ");
+  logDbg("mqtt rcv msg: %s = %s", topic.c_str(), payload_log.c_str()); 
+  cntMRcv++;
+  if (topic.startsWith(mqttTopic)) {
+      String subtopic = topic.substring(strlen(mqttTopic) + 1); // "cmd", "status" etc
+      if (subtopic == mqttCmd)
+        handleMqttRcv(payload);
+  }
+
+}
+
+void handleMqttRcv(String &payload) {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (error) {
+        logMsg("handleMqttRcv, JSON parse error: %s", error.c_str());
+        return;
+    }
+
+    const char* cmd = doc[mqttCmd];
+    if (!cmd) {
+        logMsg("handleMqttRcv, no cmd key in payload");
+        return;
+    }
+
+    if (strcmp(cmd, "getH6Export") == 0) sendLoraRequest(LoraTel::GET_H6_ENEXP);
+    else if (strcmp(cmd, "getH6Health") == 0) sendLoraRequest(LoraTel::GET_H6_HEALTH);
+    else if (strcmp(cmd, "setEspDbgON")  == 0) { debugMode = true;  logMsg("debug on");  }
+    else if (strcmp(cmd, "setEspDbgOFF") == 0) { debugMode = false; logMsg("debug off"); }
+    //else if (strcmp(cmd, "reset")       == 0) ESP.restart();
+    else logMsg("handleMqttRcv, unknown cmd: %s", cmd);
+}
+
+void mqttPubLoraPwEn() {
   bool published;
   StaticJsonDocument<200> message;
   char topic[128];
 
-  snprintf(topic, sizeof(topic), "%s/data", mqttTopic);
+  snprintf(topic, sizeof(topic), "%s/data/pwen", mqttTopic);
 
   getLocalTime(&mqttTimeInfo);
   strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
 
   message["timestamp"] = mqttLastPublishDate;
-  message["h6energy"] = h6EnPV.h6energy;
-  message["h6power"] = h6EnPV.h6power;
-  message["h6pvenergy"] = h6EnPV.h6pvenergy;
-  message["h6pvpower"] = h6EnPV.h6pvpower;
+  message["h6energy"] = h6PwEn.energy;
+  message["h6power"] = h6PwEn.power;
+  message["h6pvenergy"] = h6PwEn.pvEnergy;
+  message["h6pvpower"] = h6PwEn.pvPower;
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
  
@@ -696,21 +929,113 @@ void sendMQTTLoraData() {
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
     //ledColor.g = 255;
-    Serial.printf("%s  mqtt pub loradata, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    logDbg("%s  mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
     //delay(200);
     //ledColor.g = 0;
   }
   else {
     //ledColor.g = 255;   ledColor.b = 255;
-    Serial.printf("%s  ERROR mqtt pub loradata, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    logMsg("%s  ERROR mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
     //delay(500);
     //ledColor.g = 0;   ledColor.b = 0;
   }
 }
 
-void sendMQTTLoraStatus() {
+void mqttPubLoraEnExp() {
+  bool published;
+  StaticJsonDocument<200> message;
+  char topic[128];
+
+  snprintf(topic, sizeof(topic), "%s/data/enexp", mqttTopic);
+
+  getLocalTime(&mqttTimeInfo);
+  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
+
+  message["timestamp"] = mqttLastPublishDate;
+  message["exportEnergy"] = h6EnExp.exportEnergy;
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+ 
+  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
+  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+  if (published) {
+    //ledColor.g = 255;
+    logDbg("%s  mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    cntMPub++;
+    //delay(200);
+    //ledColor.g = 0;
+  }
+  else {
+    //ledColor.g = 255;   ledColor.b = 255;
+    logMsg("%s  ERROR mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    cntMPubErr++;
+    //delay(500);
+    //ledColor.g = 0;   ledColor.b = 0;
+  }
+}
+
+void mqttPubLoraHealth() {
+  bool published;
+  StaticJsonDocument<200> message;
+  char topic[128];
+
+  snprintf(topic, sizeof(topic), "%s/data/health", mqttTopic);
+
+  getLocalTime(&mqttTimeInfo);
+  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
+
+  message["timestamp"] = mqttLastPublishDate;
+  message["uptime"] = h6Health.uptime;
+  message["tempC"] = h6Health.tempC;
+  message["wifiRssi"] = h6Health.wifiRssi;
+  message["wifiStatus"] = wifiStatusToStr(h6Health.wifiStatus);
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+ 
+  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
+  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+  if (published) {
+    //ledColor.g = 255;
+    logDbg("%s  mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    cntMPub++;
+    //delay(200);
+    //ledColor.g = 0;
+  }
+  else {
+    //ledColor.g = 255;   ledColor.b = 255;
+    logMsg("%s  ERROR mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    cntMPubErr++;
+    //delay(500);
+    //ledColor.g = 0;   ledColor.b = 0;
+  }
+}
+// send mqtt commands to lora
+void sendLoraRequest(LoraTel cmd) {
+    int16_t status;
+    uint8_t packet[1] = { static_cast<uint8_t>(cmd) };  // enum value goes straight into the byte
+    if (xSemaphoreTake(loraMutex, pdMS_TO_TICKS(5000))) {
+        radio.standby();
+        status = radio.transmit(packet, 1);
+        radio.startReceive();  // ← back to listening
+         xSemaphoreGive(loraMutex);
+        if(status == RADIOLIB_ERR_NONE ) {
+          cntLoraSnd++;
+          logMsg("send lora msg: 0x%x", packet[0]);
+        }
+        else {
+          logMsg("[SX1262] Transmit error: %d\n", status);
+          loraLastSndErr = status;
+        }
+       
+    } 
+    else {
+        logMsg("Radio mutex timeout");
+    }
+}
+
+void mqttPubLoraStatus() {
   bool published;
   StaticJsonDocument<200> message;
   char topic[128];
@@ -732,14 +1057,14 @@ void sendMQTTLoraStatus() {
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
     //ledColor.g = 255;
-    Serial.printf("%s  mqtt pub lorastatus, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    //logDbg("%s  mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
     //delay(200);
     //ledColor.g = 0;
   }
   else {
     //ledColor.g = 255;   ledColor.b = 255;
-    Serial.printf("%s  ERROR mqtt pub lorastatus, topic: %s, payload: %s\n", mqttLastPublishDate, topic, messageBuffer);
+    logMsg("%s  ERROR mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
     //delay(500);
     //ledColor.g = 0;   ledColor.b = 0;
@@ -790,14 +1115,16 @@ void handleRoot() {
 #endif
   html += "</p>";
   html += "<p>cpu Frequency: " + String(getCpuFrequencyMhz()) + " MHz, Core: " + String(xPortGetCoreID()) +
-          ", Internal Temp: " + String(tempInt) + " C</p>";
+          ", Internal Temp: " + String(tempInt) + " C <br>";
+  html += "<p>free heap: " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB"
+       + ", min free: " + String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB</p>";     
   html += "<p>uptime: " + String(uptime) +" seconds <br>  boot at: " + String(bootTimeStr) + "</p>";
-  //html += String("<p><ul><li>h6energy:   ") + String(h6EnPV.h6energy) + " Wh,  h6power: " + String(h6EnPV.h6power) + " W</li>";
-  //html += String("<li>h6pvenergy: ") + String(h6EnPV.h6pvenergy) + " Wh,  h6pvpower: " + String(h6EnPV.h6pvpower) + " W</li>";
+  //html += String("<p><ul><li>energy:   ") + String(h6EnPV.energy) + " Wh,  power: " + String(h6EnPV.power) + " W</li>";
+  //html += String("<li>pvEnergy: ") + String(h6EnPV.pvEnergy) + " Wh,  pvPower: " + String(h6EnPV.pvPower) + " W</li>";
 #if LORA == 1  
   html += "<li>cntLora: " + String(cntLora) + ",  lora ok: " + String(cntLoraOk) + ",  lora invalid: " + String(cntLoraInv) + ",  loraErr: " + String(cntLoraErr) + ",  checksum error: " + String(cntLoraChecksum) + "</li></ul>";
-  html += "<p>lastError: " + String(lastError) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
-
+  html += "<p>lastError: " + String(lastError) +  ", last lora send error: " + String(loraLastSndErr) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
+  html += "<p>lora sent: " + String(cntLoraSnd) + "</p>";
   //html += String("<p><ul><li>bmeTem: ") + String(bmeTemp) + " C</li><li>bmeHum: " + String(bmeHum) + " %</li><li>bmePres: " + String(bmePres) + " hPa</li>";
   //html += String("<li>bmeGasRes: ") + String(bmeGasRes) + " kOhm</li>";
   //html += String("<li>cntBme: ") + String(cntBme) + "</li><li>bad val counts: bme: " + String(cntBadBme) + "</li></ul></p>";
@@ -805,26 +1132,27 @@ void handleRoot() {
   //html += "<p><table style=\"width: 80%; table-layout: fixed;\><colgroup><col style=\"width: 10%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"></colgroup>";
   html += "<p><table><colgroup><col style=\"width: 10%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"><col style=\"width: 15%;\"></colgroup>";
   html += "<tr><th>values</th><th style=\"white-space: nowrap;\">energy [Wh]</th><th style=\"white-space: nowrap;\">PVenergy [Wh]</th><th style=\"white-space: nowrap;\">power [W]</th><th style=\"white-space: nowrap;\">PVpower [W]</th><th style=\"white-space: nowrap;\">rssi [dBm]</th><th style=\"white-space: nowrap;\">snr [dB]</th></tr>";
-  html += "<tr><td>prev</td><td>"+ String(h6EnPV_prev.h6energy)  + "</td><td>" + String(h6EnPV_prev.h6pvenergy)  + "</td><td>" + String(h6EnPV_prev.h6power) + "</td><td>" + String(h6EnPV_prev.h6pvpower) + "</td><td>" + String(loraStatus_prev.rssi, 1) + "</td><td>" + String(loraStatus_prev.snr, 1) + "</td></tr>";
-  html += "<tr><td>curr</td><td>" + String(h6EnPV.h6energy)  + "</td><td>" + String(h6EnPV.h6pvenergy)  + "</td><td>" + String(h6EnPV.h6power) + "</td><td>" + String(h6EnPV.h6pvpower) + "</td><td>" + String(loraStatus.rssi, 1) + "</td><td>" + String(loraStatus.snr, 1) + "</td></tr>";
+  html += "<tr><td>prev</td><td>"+ String(h6PwEn_prev.energy)  + "</td><td>" + String(h6PwEn_prev.pvEnergy)  + "</td><td>" + String(h6PwEn_prev.power) + "</td><td>" + String(h6PwEn_prev.pvPower) + "</td><td>" + String(loraStatus_prev.rssi, 1) + "</td><td>" + String(loraStatus_prev.snr, 1) + "</td></tr>";
+  html += "<tr><td>curr</td><td>" + String(h6PwEn.energy)  + "</td><td>" + String(h6PwEn.pvEnergy)  + "</td><td>" + String(h6PwEn.power) + "</td><td>" + String(h6PwEn.pvPower) + "</td><td>" + String(loraStatus.rssi, 1) + "</td><td>" + String(loraStatus.snr, 1) + "</td></tr>";
   html += "</table></p>";
 #endif
 
   //html += "<p><table><colgroup><col style=\"width: 12%;\"><col style=\"width: 20%;\"><col style=\"width: 20%;\"><col style=\"width: 20%;\"></colgroup>";
   //html += "<tr><th>desc</th><th>temp C</th><th>delta %</th><th>raw C</th><th>bad vals</th><th>consect bad</th></tr>";
-  //html += String("<tr><td>buf5</td><td>") + tempBuf5  + String("</td><td>") + FloatRound(deltaBuf5*100, 1)  + String("</td><td>") + rawBuf5 + String("</td><td>") + cntBadBuf5 + String("</td><td>") + cntConsBadBuf5 + String("</td></tr>");
-  //html += String("<tr><td>buf2</td><td>") + tempBuf2  + String("</td><td>") + FloatRound(deltaBuf2*100, 1)  + String("</td><td>") + rawBuf2 + String("</td><td>") + cntBadBuf2 + String("</td><td>") + cntConsBadBuf2 + String("</td></tr>");
-  //html += String("<tr><td>ww</td><td>") + tempWW  + String("</td><td>") + FloatRound(deltaWW*100, 1)  + String("</td><td>") + rawWW + String("</td><td>") + cntBadWW + String("</td><td>") + cntConsBadWW + String("</td></tr>");
+  //html += String("<tr><td>buf5</td><td>") + tempBuf5  + String("</td><td>") + floatRound(deltaBuf5*100, 1)  + String("</td><td>") + rawBuf5 + String("</td><td>") + cntBadBuf5 + String("</td><td>") + cntConsBadBuf5 + String("</td></tr>");
+  //html += String("<tr><td>buf2</td><td>") + tempBuf2  + String("</td><td>") + floatRound(deltaBuf2*100, 1)  + String("</td><td>") + rawBuf2 + String("</td><td>") + cntBadBuf2 + String("</td><td>") + cntConsBadBuf2 + String("</td></tr>");
+  //html += String("<tr><td>ww</td><td>") + tempWW  + String("</td><td>") + floatRound(deltaWW*100, 1)  + String("</td><td>") + rawWW + String("</td><td>") + cntBadWW + String("</td><td>") + cntConsBadWW + String("</td></tr>");
   //html += "</table></p>";
 
 #if MQTTenable == 1  
   html += "<p>mqtt broker: " + String(MQTT_BROKER) + ", client: " + String(MQTT_CLIENT_ID) + ", topic: " + String(mqttTopic)  +
           "<br>Last Published: " + String(mqttLastPublishDate) + ", connected: " + String(mqttConnected) + "</p>";
-  html += "<p><ul><li>mqtt pubs: " + String(cntMPub) + "</li><li>mqtt errors: " + String(cntMPubErr) + "</li><li>mqtt reconnects: " + String(cntMReCon) + 
+  html += "<p><ul><li>mqtt pubs: " + String(cntMPub) + "</li><li>mqtt pub errors: " + String(cntMPubErr) + "</li><li>mqtt reconnects: " + String(cntMReCon) + 
           "</li><li>mqtt disconnects: " + String(cntMDisCon) + "</li>";
+  html += "<li>mqtt rcv: " + String(cntMRcv) + "</li>";        
   html += "</ul></p>";
 #endif  
-  html += "<p><a href=\"/info\">info</a> <a href=\"/ota\">ota</a> </p>";        
+  html += "<p><a href=\"/info\">info</a> <a href=\"/log\">log</a> <a href=\"/ota\">ota</a> </p>";        
   html += "</body></html>";
 
   server.send(200, "text/html", html);
@@ -838,6 +1166,22 @@ void handleInfo() {
   html += "<p> to build OTA update, in Arduino IDE, Menu Sketch, Export Compiled Binary, upload the esp32p4_eth_http_mqtt_ntp.ino.bin file";
   html += "<p>" + String(VERSION) + "</p>";
   html += "<p><a href=\"/\">Back to Home</a></p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleLog() {
+  String html = "<!DOCTYPE html><html>";
+  html += "<head><title>ESP32P4 lora log</title></head><body>";
+  html += "<pre>";
+  for (int i = 0; i < LOG_LINES; i++) {
+      int idx = (logHead + i) % LOG_LINES;  // oldest first
+      if (logBuffer[idx][0] != '\0') {
+          html += String(logBuffer[idx]) + "\n";
+      }
+  }
+  html += "</pre><p><a href=\"/\">Back to Home</a></p>";
   html += "</body></html>";
 
   server.send(200, "text/html", html);
@@ -932,7 +1276,7 @@ void setup() {
   char upTimeBuf[32];
   
   Serial.begin(115200);
-  Serial.printf("\n\nstarting ---------- %s -------------\n", VERSION);
+  logMsg("starting ---------- %s -------------", VERSION);
 
   /*
   Serial.printf("\nbme setup\n");
@@ -961,25 +1305,29 @@ void setup() {
     }
   }
   Serial.println("LoRa init ok\n");
+  // start interrupt driven receive
+  loraMutex = xSemaphoreCreateMutex(); //need to create here, NOT globally, FreeRTOS must be running
+  radio.setDio1Action(setFlag);
+  radio.startReceive();  
 #endif
 
 #if LAN == 1
   // ethernet setup
   Network.onEvent(onEthEvent);
-  Serial.println("Starting Ethernet...");
+  logMsg("starting eth...");
   ETH.begin(); 
-  Serial.println("Waiting for Ethernet connection...");
+  //logMsg("waiting for eth connection...");
   while (!eth_connected) {
     delay(1000);
     Serial.print("!e");
   }
   ip = ETH.localIP();
-  Serial.printf("\eth connected, ip: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+  //logMsg("eth connected, ip: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
 #endif  
 
 #if WLAN == 1
   // Connect to Wi-Fi network with SSID and password
-  Serial.printf("connecting to ssid: %s\n", ssid);
+  logMsg("connecting to ssid: %s\n", ssid);
 
   WiFi.begin(ssid, pass);
   while (WiFi.status() != WL_CONNECTED) {
@@ -990,7 +1338,7 @@ void setup() {
     delay(150);
   }
   ip = WiFi.localIP();
-  Serial.printf("\nWiFi connected to: %s, ip: %d.%d.%d.%d\n", ssid, ip[0], ip[1], ip[2], ip[3]);
+  logMsg("\nWiFi connected to: %s, ip: %d.%d.%d.%d\n", ssid, ip[0], ip[1], ip[2], ip[3]);
 #endif
 
   // check mqtt and post data if not LORA
@@ -1027,16 +1375,19 @@ void setup() {
 #endif
 
   // setup ntp
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.printf("ntp server: %s, gmtOff: %i s\n", ntpServer, gmtOffset_sec);
+  //configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // has a fixed offset, does not work in winter
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
+  logMsg("ntp server: %s, CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
   getLocalTime(&timeinfo);
-  Serial.println();
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  logMsg("Time: %s", timeBuf);
 
   // start web server Define routes and start, next time you test, make sure run tests against the test board ip, NOT the prod one...
   server.on("/", handleRoot);
   server.on("/test", handleTest);
   server.on("/info", handleInfo);
+  server.on("/log", handleLog);
   //server.on("/testled", handleTestLED);
   server.on("/ota", handleOTAUpdatePage);
   server.on("/update", HTTP_POST, handleUpdate, handleFirmwareUpload);
@@ -1064,6 +1415,7 @@ void setup() {
 #if MQTTenable == 1
   mqtt.setWill("iot/power/h6/availability", "offline", true, 1); // generate an availability feature for the HA sensors
   mqtt.begin(MQTT_BROKER, MQTT_PORT, network);
+  mqtt.onMessage(rcvMqttMessage);
   connectMQTT();
 #endif
 
@@ -1073,7 +1425,28 @@ void loop() {
   //Serial.println("Waiting for HTTP requests...");
   server.handleClient(); // WebServer client connection handling
   //delay(1000);  // Prevents flooding the serial monitor
+#if MQTTenable == 1
+  if (!mqtt.connected()) connectMQTT();
+  mqtt.loop(); // to receive messages
+#endif  
 }
+
+// get temp from MAX6675 for buffer and warm water tanks
+// 1.0.3 filter bad values, deal with inital value problem
+// 1.0.4 add buf2
+// 1.1.0 ota update feature
+// 1.2.0 add on board led color info, solder first!!, add wifi reconnect and check mqtt publish error
+// 2.0.0a copy of the esp32_temp to test bme688
+// 2.1.0 using bosch library
+// 3.0 p4 eth
+// 3.0.1 add wifi back in and enable wifi at compile time
+// 3.0.2 integrate sx1262 lora module, seems to only work on p4 dev, not the waveshare nano board
+// 3.0.5 add DEFINE for MQTT, in debug set LAN and MQTT to 0 and LORA to 1 to be able to just test LORA
+// 3.0.6 add /reset page, print lora msg as hex
+// 3.0.8 add mqtt last will / availablity
+// 3.1.0 split lora data and status, merge in some changes from esp32p4 compile switches 
+// 3.2.0 add mqtt subscription and send lora messages to request e.g. h6 power export data
+// 3.2.1 add html logging, move version info to the bottom
 
 /*
 radio.setFrequency(868.0);       // Frequency in MHz
@@ -1083,8 +1456,4 @@ radio.setCodingRate(5);          // 5-8 (higher = more error correction)
 radio.setOutputPower(14);        // TX power in dBm (max 22 dBm for SX1262)
 radio.setSyncWord(0x12);         // Private networks use 0x12, LoRaWAN uses 0x34
 radio.setPreambleLength(8);      // Preamble length
-*/
-
-RSSI: -109.0 dBm, SNR: -11.2 dB
-2026-01-12 16:00:45  sent MQTT, topic: iot/power/h6/status, payload: {"timestamp":"2026-01-12 16:00:45","h6energy":1874501,"h6power":64,"h6pvenergy":1358148,"h6pvpower":4,"rssi":-109,"snr":-11.25}
 */
