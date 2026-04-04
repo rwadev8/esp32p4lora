@@ -31,6 +31,8 @@ at the same location as the shelly lora addon reciever, here is a comparison, ro
 
 time will tell how stable this is, and how much additional data filtering i have to add to the HA sensors where the data are consumed.
 
+NB low E glass and lora are not friends, might want to try to move the device behind walls instead of low E glass, in my case just moving the receiver 1 m to the left away from the window behhind the wall improved SNR by 3 dB.
+
 ## invalid data
 the hope was that the better signal, which did not always hold true, would remove the data spikes. but the hope was unfounded it seems. but i did notice and fix a problem with floating virtual compoment values and forced them to int when sending the lora data.
 Also added a simple checksum to detect simple bit errors.
