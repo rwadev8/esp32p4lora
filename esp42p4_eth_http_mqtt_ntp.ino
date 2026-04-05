@@ -650,6 +650,9 @@ void WatchDog(void * parameter) {
 }
 
 void WatchDogLora(void* parameter) {
+    struct tm timeinfo;
+    char timeString[50];
+
     delay(5000);
     logMsg("starting lora watchdog, max silence: %d min", LORA_MAX_SILENCE/1000/60);
 
@@ -658,7 +661,10 @@ void WatchDogLora(void* parameter) {
         
         if (lastLoraRcv > 0 && elapsed > (LORA_MAX_SILENCE)) {
             cntLoraReset++;
-            logMsg("WARN: no lora rcv for %lu min, kicking radio...", elapsed / 60000);
+              getLocalTime(&timeinfo);
+              strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+            logMsg("WARN: no lora rcv for %lu min, kicking radio at: %s", elapsed / 60000, timeString);
             if (xSemaphoreTake(loraMutex, pdMS_TO_TICKS(1000))) {
                 radio.standby();
                 radio.startReceive();
@@ -1173,10 +1179,11 @@ void handleRoot() {
   //html += String("<p><ul><li>energy:   ") + String(h6EnPV.energy) + " Wh,  power: " + String(h6EnPV.power) + " W</li>";
   //html += String("<li>pvEnergy: ") + String(h6EnPV.pvEnergy) + " Wh,  pvPower: " + String(h6EnPV.pvPower) + " W</li>";
 #if LORA == 1  
-  html += "<p>loraSF: " + String(loraSF) +  ",  last lora send error: " + String(loraLastSndErr);
+  html += "<p>loraSF: " + String(loraSF) +  ", lora watchdog resets: " + String(cntLoraReset);
   html += "<br>rcv cntLora: " + String(cntLora) + ",  lora ok: " + String(cntLoraOk) + ",  lora invalid: " + String(cntLoraInv) + ",  loraErr: " + String(cntLoraErr) + ",  checksum error: " + String(cntLoraChecksum);
   html += "<br>lora sent: " + String(cntLoraSnd) + "</p>";
-  html += "<p>lastError: " + String(lastError) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
+  html += "<p>lastError: " + String(lastError) + ",  last lora send error: " + String(loraLastSndErr);
+  html += "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
   //html += String("<p><ul><li>bmeTem: ") + String(bmeTemp) + " C</li><li>bmeHum: " + String(bmeHum) + " %</li><li>bmePres: " + String(bmePres) + " hPa</li>";
   //html += String("<li>bmeGasRes: ") + String(bmeGasRes) + " kOhm</li>";
   //html += String("<li>cntBme: ") + String(cntBme) + "</li><li>bad val counts: bme: " + String(cntBadBme) + "</li></ul></p>";
