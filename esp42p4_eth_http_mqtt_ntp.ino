@@ -8,6 +8,7 @@
 #include <Update.h>
 #include <MQTTClient.h>
 #include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
 #include <RadioLib.h>
 //#include <Wire.h>
 #include "Secret.h"
@@ -26,9 +27,10 @@
 #define LOG_BOTH 2
 #define LOG_MODE LOG_WEB // define log mode
 
+
 #define BUFLEN 64
 #define ERRBUFLEN 265
-#define LOG_LINES 800
+#define LOG_LINES 500
 #define LOG_LINE_LEN 200
 char logBuffer[LOG_LINES][LOG_LINE_LEN];
 int logHead = 0;
@@ -40,7 +42,7 @@ bool debugMode = true;  // global
 #endif
 #define logDbg(fmt, ...) if (debugMode) logMsg(fmt, ##__VA_ARGS__)
 
-const char VERSION[] = "v3.2.2";
+const char VERSION[] = "v3.2.5";
 char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
@@ -59,6 +61,7 @@ char lastError[ERRBUFLEN] = {0};  // initialize empty
 #define LORA_MISO  16
 #define LORA_RST   18
 #define LORA_BUSY  19
+const uint8_t loraSF = 11;
 
 //GND
 #define LORA_RXEN  21
@@ -71,6 +74,8 @@ Module mod(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 SX1262 radio(&mod);
 SemaphoreHandle_t loraMutex = xSemaphoreCreateMutex();
 volatile bool loraRcvFlag = false;
+unsigned long lastLoraRcv;
+#define LORA_MAX_SILENCE (10 * 60 * 1000)  // 10 minutes
 
 // Set web server port number to 80
 WebServer server(80);
@@ -87,6 +92,8 @@ IPAddress ip;
 
 MQTTClient mqtt = MQTTClient(256);
 int mqttPubInt = 30 * 1000;
+unsigned long lastMqttAttempt = 0;
+const unsigned long MQTT_RETRY_INTERVAL = 2000; // 2 seconds
 
 #if PROD == 1
   const char mqttTopic[] = "iot/power/h6"; 
@@ -114,6 +121,7 @@ int cntLoraErr = 0;
 int cntLoraInv = 0;
 int cntLoraChecksum = 0;
 int cntLoraSnd = 0;
+int cntLoraReset = 0;
 
 const int initTemp = 15.0;
 
@@ -135,9 +143,6 @@ float deltaWW = 0.0;
 
 float rawBmeTemp, rawBmeHum, rawBmePres, rawBmeGasRes;
 
-struct rgbColor { int r; int g; int b;};
-volatile rgbColor ledColor = {0,0,0};
-
 // Current time
 unsigned long currentTime = millis();
 // Previous time
@@ -151,6 +156,10 @@ String bootTimeStr;  // Save formatted boot time string
 TaskHandle_t TPostMqtt;
 TaskHandle_t TGetNtpTime;
 TaskHandle_t TWatchDog;
+#if LORA == 1
+  TaskHandle_t TWatchDogLora;
+#endif
+TaskHandle_t TMonLED;
 #if WLAN == 1
   TaskHandle_t TWifiCheckReconn;
 #endif  
@@ -212,7 +221,8 @@ enum class LoraTel : uint8_t {
     GET_H6_ENEXP    = 0xaa,  // request energy export data
     GET_H6_HEALTH   = 0xbb,  // request health data
     SET_ESP_DBGOFF  = 0xf0,  // disable debug logging
-    SET_ESP_DBGON   = 0xf1  // enable debug logging
+    SET_ESP_DBGON   = 0xf1,  // enable debug logging
+    RECON_MQTT      = 0xf2   // reconnect mqtt
 };
 
 enum class WifiStatus : uint8_t {
@@ -249,12 +259,19 @@ const char* updatePage = R"rawliteral(
 
 // led tests
 // Define the pin where the built-in RGB LED is connected
-//#define LED_PIN 48
+#if NEOPIXEL == 1
+#define LED_PIN 48
 // Define the number of LEDs in the strip (usually 1 for built-in LED)
-//#define NUM_LEDS 1
-//Adafruit_NeoPixel led(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
-//struct rgbColor { int r; int g; int b;};
-//volatile rgbColor ledColor = {0,0,0};
+#define NUM_LEDS 1
+Adafruit_NeoPixel led(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+struct rgbColor { int r; int g; int b;};
+volatile rgbColor ledColor = {0,0,0};
+#endif
+#if NEOPIXEL == 1
+  #define NEO(code) code
+#else
+  #define NEO(code)
+#endif
 
 ////////////////////////////////////////////////////
 // helper functions
@@ -394,7 +411,7 @@ bool parsePwEn(uint8_t* data, size_t len, ShellyPWEN* result) {
   
   if (receivedChecksum != calculatedChecksum) {
     cntLoraChecksum++;
-    logMsg("ERR checksum failed! Received: 0x%02X, Calculated: 0x%02X\n", 
+    logMsg("ERR checksum failed! Received: 0x%02X, Calculated: 0x%02X", 
                   receivedChecksum, calculatedChecksum);
     return false;
   }
@@ -540,16 +557,6 @@ void PostMQTT(void * parameter) {
   delay(5000);
 
   for(;;) {
-#if MQTTenable == 1    
-    if(!mqtt.connected()) {
-      //TODO a reconnect would be really helpful here
-      Serial.print("m");
-      delay(1000);
-      connectMQTT();
-      cntMReCon++;
-    }
-    mqtt.loop(); // this i supposed to keep the connection alive according to chatcpt
-#endif    
     // for lora do not publish  
 #if LORA != 1      
     if(millis() - mqttPublishTime > mqttPubInt) {
@@ -558,7 +565,7 @@ void PostMQTT(void * parameter) {
 #endif      
       mqttPublishTime = millis();
     }
-    delay(250);
+    vTaskDelay(250 / portTICK_PERIOD_MS);
 #endif
    
   } // for
@@ -578,9 +585,9 @@ void WifiCheckReconn(void * parameter) {
   delay(1000);
 
   for(;;) {
-    //ledColor.r = 255; ledColor.g = 100;
-    //delay(500);
-    //ledColor.r = 0; ledColor.g = 0;
+    NEO(ledColor.r = 255; ledColor.g = 100;)
+    NEO(delay(500);)
+    NEO(ledColor.r = 0; ledColor.g = 0;)
 
     if (WiFi.status() != WL_CONNECTED) {
         //ledColor.r = 255;
@@ -590,7 +597,7 @@ void WifiCheckReconn(void * parameter) {
         delay(2000);
         if (WiFi.status() == WL_CONNECTED) {
           Serial.printf("wifi reconn ok\n");
-          //ledColor.r = 0;
+          NEO(ledColor.r = 0;)
         }
         else {
           Serial.printf("wifi reconn FAILED\n");
@@ -630,16 +637,38 @@ void WatchDog(void * parameter) {
   delay(5000);
 
   for(;;) {
-    //ledColor.b = 255;
-    //delay(500);
-    //ledColor.b = 0;
+    NEO(ledColor.b = 255;)
+    NEO(delay(500);)
+    NEO(ledColor.b = 0;)
 
     // this works fine
-    //led.setPixelColor(0, led.Color(0, 0, 255));  // Set blue
-    //led.show();
+    NEO(led.setPixelColor(0, led.Color(0, 0, 255));)  // Set blue
+    NEO(led.show();)
 
     vTaskDelay(pdMS_TO_TICKS(60*1000));
   } // for
+}
+
+void WatchDogLora(void* parameter) {
+    delay(5000);
+    logMsg("starting lora watchdog, max silence: %d min", LORA_MAX_SILENCE/1000/60);
+
+    for(;;) {
+        unsigned long elapsed = millis() - lastLoraRcv;
+        
+        if (lastLoraRcv > 0 && elapsed > (LORA_MAX_SILENCE)) {
+            cntLoraReset++;
+            logMsg("WARN: no lora rcv for %lu min, kicking radio...", elapsed / 60000);
+            if (xSemaphoreTake(loraMutex, pdMS_TO_TICKS(1000))) {
+                radio.standby();
+                radio.startReceive();
+                xSemaphoreGive(loraMutex);
+            }
+        } else {
+            logDbg("lora watchdog ok, last rcv %lu sec ago", elapsed / 1000);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2*60*1000)); // run every 2 minutes, also good to see if code still runs at all...
+    }
 }
 
 void LoraReceiveTask(void* parameter) {
@@ -651,8 +680,9 @@ void LoraReceiveTask(void* parameter) {
       loraRcvFlag = false;
     
       if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
+        memset(buffer, 0, BUFLEN);  // clear buffer first
         size_t len = radio.getPacketLength(true);
-        //logDbg("lora rcv raw packet len: %d", len);
+        logDbg("lora rcv raw packet len: %d", len);
         //if (len == 0) len = BUFLEN; // if len is 0, fall back to BUFLEN first claude suggestion
         if (len == 0) {
             logDbg("zero length packet, ignoring");
@@ -667,6 +697,7 @@ void LoraReceiveTask(void* parameter) {
         xSemaphoreGive(loraMutex);
 
         if (status == RADIOLIB_ERR_NONE) {
+          lastLoraRcv = millis();
           cntLora++;
           bufferToHex(buffer, len, currMsg, BUFLEN);
           logMsg("lora rcv: %d bytes,  tel: %02x,  rssi: %.1f dBm, snr: %.1f dB", len, buffer[0], rssi, snr);
@@ -739,7 +770,7 @@ void LoraReceiveTask(void* parameter) {
           // Normal timeout - no packet received
         } 
         else {
-          logMsg("[SX1262] receive error: %d\n", status);
+          logMsg("[SX1262] receive error: %d", status);
           cntLoraErr++;
           loraLastRcvErr = status;
         }
@@ -750,6 +781,22 @@ void LoraReceiveTask(void* parameter) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
+#if NEOPIXEL == 1
+void MonLED(void * parameter) {
+  // at startup wait a few seconds to allow connections to stablize
+  //delay(1000);
+  led.setBrightness(16); // set global brightness 255 is 100 %
+  led.clear();
+  led.show();
+
+  for(;;) {
+    led.setPixelColor(0, led.Color(ledColor.r, ledColor.g, ledColor.b));
+    led.show(); // Turn off LED initially
+    delay(50);
+  } // for
+}
+#endif
 
 bool initLoRa() {
   pinMode(LORA_RXEN, OUTPUT);
@@ -783,16 +830,16 @@ bool initLoRa() {
     radio.setRfSwitchPins(LORA_RXEN, LORA_TXEN);
     
     // Configure LoRa parameters
-    radio.setSpreadingFactor(12);
+    radio.setSpreadingFactor(loraSF); //sf12 gets around 0 dB
     radio.setBandwidth(125.0);
     radio.setCodingRate(5);
     radio.setOutputPower(22);
     
-    logMsg("lora config ok");
+    logMsg("lora config ok, SF: %u", loraSF);
     return true;
   } 
   else {
-    logMsg("ERR lora init failed, code: %d\n", state);
+    logMsg("ERR lora init failed, code: %d", state);
     return false;
   }
 }
@@ -802,32 +849,35 @@ bool initLoRa() {
 void connectMQTT() {
   // Connect to the MQTT broker
   //mqtt.begin(MQTT_BROKER, MQTT_PORT, network); // move to setup to be able to use this call for reconnects
+  char mqttConnecTime[40];
 
+  // check if we need to do anything
+  if (mqtt.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttAttempt < MQTT_RETRY_INTERVAL) return;
+  lastMqttAttempt = now;
+ 
+  getLocalTime(&mqttTimeInfo);
+  strftime(mqttConnecTime, sizeof(mqttConnecTime), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
   mqtt.setKeepAlive(180);  // set mqtt keepalive
  
-  logMsg("connecting to mqtt broker %s:%d", MQTT_BROKER, MQTT_PORT);
+  logMsg("connecting to mqtt broker %s:%d at: %s ...", MQTT_BROKER, MQTT_PORT, mqttConnecTime);
   
-  while (!mqtt.connect(MQTT_CLIENT_ID)) {
-    //ledColor.g = 255; ledColor.b = 255;
-    Serial.print("!m");
-    //delay(250);
-    //ledColor.g = 0;  ledColor.b = 0;
-    delay(500);
-    cntMDisCon++;
-  }
+  if (mqtt.connect(MQTT_CLIENT_ID)) {
+      //logMsg("MQTT connected");
+      mqtt.publish("iot/power/h6/availability", "online", true, 1);
 
-  if (!mqtt.connected()) {
-      logMsg("ERR MQTT Connection failed");
-      return;
+      char subTopic[64];
+      snprintf(subTopic, sizeof(subTopic), "%s/%s", mqttTopic, mqttCmd);
+      mqtt.subscribe(subTopic);
+      logMsg("subscribed to: %s", subTopic);
+
+      cntMReCon++;
+  } else {
+      Serial.print("!m");
+      cntMDisCon++;
   }
-  //last will
-  mqtt.publish("iot/power/h6/availability", "online", true, 1);
-  // subscriptions
-  char subTopic[64];
-  snprintf(subTopic, sizeof(subTopic), "%s/%s", mqttTopic, mqttCmd);
-  mqtt.subscribe(subTopic);
-  logMsg("subscribed to: %s", subTopic);
-  cntMReCon++;
 }
 
 void mqttPubTempData() {
@@ -850,18 +900,18 @@ void mqttPubTempData() {
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
-    ledColor.g = 255;
+    NEO(ledColor.g = 255;)
     logDbg("%s  mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
-    delay(200);
-    ledColor.g = 0;
+    NEO(delay(200);)
+    NEO(ledColor.g = 0;)
   }
   else {
-    ledColor.g = 255;   ledColor.b = 255;
+    NEO(ledColor.g = 255;   ledColor.b = 255;)
     logMsg("%s  ERROR mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
-    delay(500);
-    ledColor.g = 0;   ledColor.b = 0;
+    NEO(delay(500);)
+    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 
@@ -903,6 +953,7 @@ void handleMqttRcv(String &payload) {
     else if (strcmp(cmd, "getH6Health") == 0) sendLoraRequest(LoraTel::GET_H6_HEALTH);
     else if (strcmp(cmd, "setEspDbgON")  == 0) { debugMode = true;  logMsg("debug on");  }
     else if (strcmp(cmd, "setEspDbgOFF") == 0) { debugMode = false; logMsg("debug off"); }
+    else if (strcmp(cmd, "reconnMqtt") == 0) { connectMQTT(); }
     //else if (strcmp(cmd, "reset")       == 0) ESP.restart();
     else logMsg("handleMqttRcv, unknown cmd: %s", cmd);
 }
@@ -928,18 +979,18 @@ void mqttPubLoraPwEn() {
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
-    //ledColor.g = 255;
+    NEO(ledColor.g = 255;)
     logDbg("%s  mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
-    //delay(200);
-    //ledColor.g = 0;
+    NEO(delay(200);)
+    NEO(ledColor.g = 0;)
   }
   else {
-    //ledColor.g = 255;   ledColor.b = 255;
+    NEO(ledColor.g = 255;   ledColor.b = 255;)
     logMsg("%s  ERROR mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
-    //delay(500);
-    //ledColor.g = 0;   ledColor.b = 0;
+    NEO(delay(500);)
+    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 
@@ -961,18 +1012,18 @@ void mqttPubLoraEnExp() {
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
-    //ledColor.g = 255;
+    NEO(ledColor.g = 255;)
     logDbg("%s  mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
-    //delay(200);
-    //ledColor.g = 0;
+    NEO(delay(200);)
+    NEO(ledColor.g = 0;)
   }
   else {
-    //ledColor.g = 255;   ledColor.b = 255;
+    NEO(ledColor.g = 255;   ledColor.b = 255;)
     logMsg("%s  ERROR mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
-    //delay(500);
-    //ledColor.g = 0;   ledColor.b = 0;
+    NEO(delay(500);)
+    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 
@@ -995,20 +1046,20 @@ void mqttPubLoraHealth() {
   serializeJson(message, messageBuffer);
  
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+  published = mqtt.publish(topic, messageBuffer, true, 1); // true,1 for retain and QoS at least once, to deal with HA restarts //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
-    //ledColor.g = 255;
+    NEO(ledColor.g = 255;)
     logDbg("%s  mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
-    //delay(200);
-    //ledColor.g = 0;
+    NEO(delay(200);)
+    NEO(ledColor.g = 0;)
   }
   else {
-    //ledColor.g = 255;   ledColor.b = 255;
+    NEO(ledColor.g = 255;   ledColor.b = 255;)
     logMsg("%s  ERROR mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
-    //delay(500);
-    //ledColor.g = 0;   ledColor.b = 0;
+    NEO(delay(500);)
+    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 // send mqtt commands to lora
@@ -1025,7 +1076,7 @@ void sendLoraRequest(LoraTel cmd) {
           logMsg("send lora msg: 0x%x", packet[0]);
         }
         else {
-          logMsg("[SX1262] Transmit error: %d\n", status);
+          logMsg("[SX1262] Transmit error: %d", status);
           loraLastSndErr = status;
         }
        
@@ -1056,18 +1107,20 @@ void mqttPubLoraStatus() {
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
   published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
   if (published) {
-    //ledColor.g = 255;
+    NEO(ledColor.g = 255;)
     //logDbg("%s  mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPub++;
-    //delay(200);
-    //ledColor.g = 0;
+    NEO(delay(200);)
+    NEO(ledColor.g = 0;)
   }
   else {
-    //ledColor.g = 255;   ledColor.b = 255;
+    NEO(ledColor.g = 255;   ledColor.b = 255;)
     logMsg("%s  ERROR mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
     cntMPubErr++;
-    //delay(500);
-    //ledColor.g = 0;   ledColor.b = 0;
+    logMsg("  publish failed, forcing reconnect");
+    mqtt.disconnect();   // force state reset
+    NEO(delay(500);)
+    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 // ==================== html server pages, thanks ChatGPT, well, besides the test or testLED fiasko
@@ -1114,17 +1167,16 @@ void handleRoot() {
   html += ", rssi: " + String(rssi) + " dBm, WiFi reconnects: " + cntWifiReConn;
 #endif
   html += "</p>";
-  html += "<p>cpu Frequency: " + String(getCpuFrequencyMhz()) + " MHz, Core: " + String(xPortGetCoreID()) +
-          ", Internal Temp: " + String(tempInt) + " C <br>";
-  html += "<p>free heap: " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB"
-       + ", min free: " + String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB</p>";     
-  html += "<p>uptime: " + String(uptime) +" seconds <br>  boot at: " + String(bootTimeStr) + "</p>";
+  html += "<p>cpu Frequency: " + String(getCpuFrequencyMhz()) + " MHz, Core: " + String(xPortGetCoreID()) + ", Internal Temp: " + String(tempInt) + " C";
+  html += "<br>free heap: " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB" + ", min free: " + String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB</p>";     
+  html += "<p>  boot at: " + String(bootTimeStr) + ", uptime: " + String(uptime) +" sec</p>";
   //html += String("<p><ul><li>energy:   ") + String(h6EnPV.energy) + " Wh,  power: " + String(h6EnPV.power) + " W</li>";
   //html += String("<li>pvEnergy: ") + String(h6EnPV.pvEnergy) + " Wh,  pvPower: " + String(h6EnPV.pvPower) + " W</li>";
 #if LORA == 1  
-  html += "<li>cntLora: " + String(cntLora) + ",  lora ok: " + String(cntLoraOk) + ",  lora invalid: " + String(cntLoraInv) + ",  loraErr: " + String(cntLoraErr) + ",  checksum error: " + String(cntLoraChecksum) + "</li></ul>";
-  html += "<p>lastError: " + String(lastError) +  ", last lora send error: " + String(loraLastSndErr) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
-  html += "<p>lora sent: " + String(cntLoraSnd) + "</p>";
+  html += "<p>loraSF: " + String(loraSF) +  ",  last lora send error: " + String(loraLastSndErr);
+  html += "<br>rcv cntLora: " + String(cntLora) + ",  lora ok: " + String(cntLoraOk) + ",  lora invalid: " + String(cntLoraInv) + ",  loraErr: " + String(cntLoraErr) + ",  checksum error: " + String(cntLoraChecksum);
+  html += "<br>lora sent: " + String(cntLoraSnd) + "</p>";
+  html += "<p>lastError: " + String(lastError) + "<br>curr: " + String(currMsg) + "<br>good: " + String(lastGoodMsg) + "</p>";
   //html += String("<p><ul><li>bmeTem: ") + String(bmeTemp) + " C</li><li>bmeHum: " + String(bmeHum) + " %</li><li>bmePres: " + String(bmePres) + " hPa</li>";
   //html += String("<li>bmeGasRes: ") + String(bmeGasRes) + " kOhm</li>";
   //html += String("<li>cntBme: ") + String(cntBme) + "</li><li>bad val counts: bme: " + String(cntBadBme) + "</li></ul></p>";
@@ -1152,6 +1204,7 @@ void handleRoot() {
   html += "<li>mqtt rcv: " + String(cntMRcv) + "</li>";        
   html += "</ul></p>";
 #endif  
+  html += "<p>" + String(VERSION) + "</p>";
   html += "<p><a href=\"/info\">info</a> <a href=\"/log\">log</a> <a href=\"/ota\">ota</a> </p>";        
   html += "</body></html>";
 
@@ -1295,21 +1348,6 @@ void setup() {
     bme.setGasHeater(300, 100); // Temp in °C, duration in ms
   }
   */
-#if LORA == 1  
-  Serial.println("Waiting for LoRa initialization...");
-  while (!lora_initialized) {
-    lora_initialized = initLoRa();
-    if (!lora_initialized) {
-      Serial.print("!l");
-      delay(5000);  // Wait 5 seconds before retry
-    }
-  }
-  Serial.println("LoRa init ok\n");
-  // start interrupt driven receive
-  loraMutex = xSemaphoreCreateMutex(); //need to create here, NOT globally, FreeRTOS must be running
-  radio.setDio1Action(setFlag);
-  radio.startReceive();  
-#endif
 
 #if LAN == 1
   // ethernet setup
@@ -1327,19 +1365,44 @@ void setup() {
 
 #if WLAN == 1
   // Connect to Wi-Fi network with SSID and password
-  logMsg("connecting to ssid: %s\n", ssid);
+  logMsg("connecting to ssid: %s", ssid);
 
   WiFi.begin(ssid, pass);
   while (WiFi.status() != WL_CONNECTED) {
-    //ledColor.r = 255;
+    NEO(ledColor.r = 255;)
     delay(1000);
     Serial.print("!w");
     cntWifiReConn++;
     delay(150);
   }
   ip = WiFi.localIP();
-  logMsg("\nWiFi connected to: %s, ip: %d.%d.%d.%d\n", ssid, ip[0], ip[1], ip[2], ip[3]);
+  logMsg("WiFi connected to: %s, ip: %d.%d.%d.%d", ssid, ip[0], ip[1], ip[2], ip[3]);
 #endif
+
+#if LORA == 1  
+  logDbg("LoRa init...");
+  while (!lora_initialized) {
+    lora_initialized = initLoRa();
+    if (!lora_initialized) {
+      Serial.print("!l");
+      delay(5000);  // Wait 5 seconds before retry
+    }
+  }
+  logDbg("LoRa init ok");
+  // start interrupt driven receive
+  loraMutex = xSemaphoreCreateMutex(); //need to create here, NOT globally, FreeRTOS must be running
+  radio.setDio1Action(setFlag);
+  radio.startReceive();  
+#endif
+
+  // setup ntp before MQTT to get time in log
+  //configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // has a fixed offset, does not work in winter
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
+  logMsg("ntp server: %s, CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
+  getLocalTime(&timeinfo);
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  logMsg("Time: %s", timeBuf);
 
   // check mqtt and post data if not LORA
 #if MQTTenable == 1  
@@ -1353,6 +1416,11 @@ void setup() {
       WatchDog, "TaskWatchDog", 10000,  NULL,  /* Task input parameter */
       0,  /* Priority of the task */  &TWatchDog,  /* Task handle. */
       1); /* Core where the task should run */
+
+#if LORA == 1
+  xTaskCreatePinnedToCore(
+    WatchDogLora, "TaskWatchDogLora", 4096, NULL, 0, &TWatchDogLora, 1);
+#endif
 
 #if WLAN == 1
   xTaskCreatePinnedToCore(
@@ -1374,15 +1442,6 @@ void setup() {
   );
 #endif
 
-  // setup ntp
-  //configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // has a fixed offset, does not work in winter
-  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
-  logMsg("ntp server: %s, CET-1CEST,M3.5.0,M10.5.0/3", ntpServer);
-  getLocalTime(&timeinfo);
-  char timeBuf[32];
-  strftime(timeBuf, sizeof(timeBuf), "%A, %B %d %Y %H:%M:%S", &timeinfo);
-  logMsg("Time: %s", timeBuf);
-
   // start web server Define routes and start, next time you test, make sure run tests against the test board ip, NOT the prod one...
   server.on("/", handleRoot);
   server.on("/test", handleTest);
@@ -1400,7 +1459,7 @@ void setup() {
   });
   */
   server.begin();
-  Serial.printf("HTTP web server started\n");
+  Serial.printf("HTTP web server started");
 
 #if NTP == 1
   while (!getLocalTime(&timeinfo)) {
@@ -1419,16 +1478,33 @@ void setup() {
   connectMQTT();
 #endif
 
+#if NEOPIXEL == 1
+  xTaskCreatePinnedToCore(
+      MonLED, "TaskMonLED", 10000,  NULL,  /* Task input parameter */
+      0,  /* Priority of the task */  &TMonLED,  /* Task handle. */
+      1); /* Core where the task should run */
+#endif
+
 }
 
 void loop() {
   //Serial.println("Waiting for HTTP requests...");
   server.handleClient(); // WebServer client connection handling
   //delay(1000);  // Prevents flooding the serial monitor
+
 #if MQTTenable == 1
-  if (!mqtt.connected()) connectMQTT();
-  mqtt.loop(); // to receive messages
-#endif  
+  mqtt.loop();
+  if (!mqtt.connected()) {
+    unsigned long now = millis();
+
+    if (now - lastMqttAttempt > MQTT_RETRY_INTERVAL) {
+      lastMqttAttempt = now;
+      connectMQTT();
+    }
+  //} else { this did not seem be sufficient as connected returns but it is not
+  //  mqtt.loop();  // only useful when connected
+  }
+#endif
 }
 
 // get temp from MAX6675 for buffer and warm water tanks
@@ -1447,6 +1523,8 @@ void loop() {
 // 3.1.0 split lora data and status, merge in some changes from esp32p4 compile switches 
 // 3.2.0 add mqtt subscription and send lora messages to request e.g. h6 power export data
 // 3.2.1 add html logging, move version info to the bottom
+// 3.2.4 fix multi mqtt loop after receiver running in loop(), merge led code back in
+// 3.2.5 add lora watchdog task to attempt to remedy receive hangs
 
 /*
 radio.setFrequency(868.0);       // Frequency in MHz
