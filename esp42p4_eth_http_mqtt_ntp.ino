@@ -42,7 +42,7 @@ bool debugMode = true;  // global
 #endif
 #define logDbg(fmt, ...) if (debugMode) logMsg(fmt, ##__VA_ARGS__)
 
-const char VERSION[] = "v3.2.5";
+const char VERSION[] = "v3.2.6";
 char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
@@ -158,11 +158,13 @@ TaskHandle_t TGetNtpTime;
 TaskHandle_t TWatchDog;
 #if LORA == 1
   TaskHandle_t TWatchDogLora;
+  TaskHandle_t TLoraReceiveTask;
 #endif
 TaskHandle_t TMonLED;
 #if WLAN == 1
   TaskHandle_t TWifiCheckReconn;
 #endif  
+TaskHandle_t TLoopMqtt;
 
 // h6 lora
 char currMsg[BUFLEN * 3 + 1];
@@ -401,7 +403,7 @@ uint8_t calculateCrc8(uint8_t* data, size_t len) {
 bool parsePwEn(uint8_t* data, size_t len, ShellyPWEN* result) {
   int telLen = 14;
   if (len != telLen) {  // Changed from 12 to 13
-    logMsg(" WARN: unexpected payload health length: %d bytes (expected %d)\n", len, telLen);
+    logMsg(" WARN: unexpected payload pwen length: %d bytes (expected %d)\n", len, telLen);
     return false;
   }
   
@@ -428,7 +430,7 @@ bool parsePwEn(uint8_t* data, size_t len, ShellyPWEN* result) {
 bool parseEnExp(uint8_t* data, size_t len, ShellyENEXP* result) {
   int telLen = 6;
   if (len != telLen) {  
-    logMsg(" WARN: unexpected payload health length: %d bytes (expected %d)\n", len, telLen);
+    logMsg(" WARN: unexpected payload enexp length: %d bytes (expected %d)\n", len, telLen);
     return false;
   }
   
@@ -565,9 +567,8 @@ void PostMQTT(void * parameter) {
 #endif      
       mqttPublishTime = millis();
     }
-    vTaskDelay(250 / portTICK_PERIOD_MS);
 #endif
-   
+   vTaskDelay(250 / portTICK_PERIOD_MS);
   } // for
 }
 
@@ -677,6 +678,21 @@ void WatchDogLora(void* parameter) {
     }
 }
 
+void LoopMqtt(void * parameter) {
+  // at startup wait a few seconds to allow connections to stablize
+  delay(5000);
+
+  for(;;) {
+        if (mqtt.connected()) {
+            mqtt.loop();
+        } else {
+            logMsg("MQTT disconnected, reconnecting...");
+            connectMQTT();
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
 void LoraReceiveTask(void* parameter) {
   uint8_t buffer[BUFLEN] = {0};  // zero initialised;
   Serial.println("LoRa receive task started");
@@ -784,7 +800,7 @@ void LoraReceiveTask(void* parameter) {
     }  // loraRcvFlag  
     
     // CRITICAL: Always yield to prevent watchdog
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -866,7 +882,6 @@ void connectMQTT() {
  
   getLocalTime(&mqttTimeInfo);
   strftime(mqttConnecTime, sizeof(mqttConnecTime), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
-  mqtt.setKeepAlive(180);  // set mqtt keepalive
  
   logMsg("connecting to mqtt broker %s:%d at: %s ...", MQTT_BROKER, MQTT_PORT, mqttConnecTime);
   
@@ -1016,7 +1031,7 @@ void mqttPubLoraEnExp() {
   serializeJson(message, messageBuffer);
  
   // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+  published = mqtt.publish(topic, messageBuffer, true, 1); //retain and qos 1 to deal with ha restarts
   if (published) {
     NEO(ledColor.g = 255;)
     logDbg("%s  mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
@@ -1174,7 +1189,14 @@ void handleRoot() {
 #endif
   html += "</p>";
   html += "<p>cpu Frequency: " + String(getCpuFrequencyMhz()) + " MHz, Core: " + String(xPortGetCoreID()) + ", Internal Temp: " + String(tempInt) + " C";
-  html += "<br>free heap: " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB" + ", min free: " + String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB</p>";     
+  html += "<br>free heap: " + String(ESP.getFreeHeap() / 1024.0, 1) + " KB" + ", min free: " + String(ESP.getMinFreeHeap() / 1024.0, 1) + " KB";     
+// task stack high water marks - how close to stack overflow
+  html += "<br>stack remaining: ";
+  html += "LoRa task: " + String(uxTaskGetStackHighWaterMark(TLoraReceiveTask) * 4) + " bytes, ";
+  html += "WatchDog: "  + String(uxTaskGetStackHighWaterMark(TWatchDog) * 4) + " bytes, ";
+  html += "WatchDogLora: "  + String(uxTaskGetStackHighWaterMark(TWatchDogLora) * 4) + " bytes, ";
+  html += "LoopMqtt: "  + String(uxTaskGetStackHighWaterMark(TLoopMqtt) * 4) + " bytes, ";
+  html += "PostMQTT: "  + String(uxTaskGetStackHighWaterMark(TPostMqtt) * 4) + " bytes</p>";  
   html += "<p>  boot at: " + String(bootTimeStr) + ", uptime: " + String(uptime) +" sec</p>";
   //html += String("<p><ul><li>energy:   ") + String(h6EnPV.energy) + " Wh,  power: " + String(h6EnPV.power) + " W</li>";
   //html += String("<li>pvEnergy: ") + String(h6EnPV.pvEnergy) + " Wh,  pvPower: " + String(h6EnPV.pvPower) + " W</li>";
@@ -1414,13 +1436,13 @@ void setup() {
   // check mqtt and post data if not LORA
 #if MQTTenable == 1  
   xTaskCreatePinnedToCore(
-      PostMQTT, "PostMqtt", 10000,  NULL,  /* Task input parameter */
+      PostMQTT, "PostMqtt", 4096,  NULL,  /* Task input parameter */
       0,  /* Priority of the task */  &TPostMqtt,  /* Task handle. */
       0); /* Core where the task should run */
 #endif
 
   xTaskCreatePinnedToCore(
-      WatchDog, "TaskWatchDog", 10000,  NULL,  /* Task input parameter */
+      WatchDog, "TaskWatchDog", 4096,  NULL,  /* Task input parameter */
       0,  /* Priority of the task */  &TWatchDog,  /* Task handle. */
       1); /* Core where the task should run */
 
@@ -1431,21 +1453,16 @@ void setup() {
 
 #if WLAN == 1
   xTaskCreatePinnedToCore(
-      WifiCheckReconn, "TaskWifiCheckReconn", 10000,  NULL,  /* Task input parameter */
+      WifiCheckReconn, "TaskWifiCheckReconn", 4096,  NULL,  /* Task input parameter */
       0,  /* Priority of the task */  &TWifiCheckReconn,  /* Task handle. */
       1); /* Core where the task should run */
 #endif
 
 #if LORA == 1
-  // Create LoRa receive task on core 1
   xTaskCreatePinnedToCore(
-    LoraReceiveTask,   // Function
-    "LoRa RX",         // Name
-    4096,              // Stack size
-    NULL,              // Parameters
-    1,                 // Priority
-    NULL,              // Task handle
-    1                  // Core (0 or 1)
+    LoraReceiveTask, "TaskLoRaRcv", 8192, /* Stack size */
+    NULL, /* input params */  1, /* Priority */ &TLoraReceiveTask,     // Task handle
+    1    // Core (0 or 1)
   );
 #endif
 
@@ -1479,15 +1496,18 @@ void setup() {
   bootTimeStr = String(upTimeBuf);
 
 #if MQTTenable == 1
+  mqtt.setKeepAlive(180);  // set mqtt keepalive
   mqtt.setWill("iot/power/h6/availability", "offline", true, 1); // generate an availability feature for the HA sensors
   mqtt.begin(MQTT_BROKER, MQTT_PORT, network);
   mqtt.onMessage(rcvMqttMessage);
   connectMQTT();
+
+  xTaskCreatePinnedToCore(LoopMqtt, "TaskLoopMqtt", 8192, NULL, 0, &TLoopMqtt, 0); // create task AFTER conenctMqtt()
 #endif
 
 #if NEOPIXEL == 1
   xTaskCreatePinnedToCore(
-      MonLED, "TaskMonLED", 10000,  NULL,  /* Task input parameter */
+      MonLED, "TaskMonLED", 4096,  NULL,  /* Task input parameter */
       0,  /* Priority of the task */  &TMonLED,  /* Task handle. */
       1); /* Core where the task should run */
 #endif
@@ -1498,20 +1518,6 @@ void loop() {
   //Serial.println("Waiting for HTTP requests...");
   server.handleClient(); // WebServer client connection handling
   //delay(1000);  // Prevents flooding the serial monitor
-
-#if MQTTenable == 1
-  mqtt.loop();
-  if (!mqtt.connected()) {
-    unsigned long now = millis();
-
-    if (now - lastMqttAttempt > MQTT_RETRY_INTERVAL) {
-      lastMqttAttempt = now;
-      connectMQTT();
-    }
-  //} else { this did not seem be sufficient as connected returns but it is not
-  //  mqtt.loop();  // only useful when connected
-  }
-#endif
 }
 
 // get temp from MAX6675 for buffer and warm water tanks
