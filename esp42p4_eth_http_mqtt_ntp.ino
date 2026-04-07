@@ -42,7 +42,7 @@ bool debugMode = true;  // global
 #endif
 #define logDbg(fmt, ...) if (debugMode) logMsg(fmt, ##__VA_ARGS__)
 
-const char VERSION[] = "v3.2.6";
+const char VERSION[] = "v3.2.7";
 char lastError[ERRBUFLEN] = {0};  // initialize empty
 
 #ifndef ETH_PHY_MDC
@@ -109,6 +109,7 @@ char mqttLastPublishDate[40];
 int cntMReCon = 0;
 int cntMDisCon = 0;
 int cntMPub = 0;
+int cntMPubConsec = 0;
 int cntMPubErr = 0;
 int cntMRcv = 0;
 int cntWifiReConn = 0;
@@ -348,20 +349,26 @@ void clearLastError() {
 }
 
 void logMsg(const char* fmt, ...) {
+    char timeBuf[20];
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        strftime(timeBuf, sizeof(timeBuf), "%m-%d %H:%M:%S", &timeinfo);
+    } else {
+        snprintf(timeBuf, sizeof(timeBuf), "%lu", millis() / 1000);  // fallback to uptime
+    }
+
+    char lineBuf[LOG_LINE_LEN];
     va_list args;
     va_start(args, fmt);
-    
-    #if LOG_MODE == LOG_WEB || LOG_MODE == LOG_BOTH
-        vsnprintf(logBuffer[logHead], LOG_LINE_LEN, fmt, args);
-        logHead = (logHead + 1) % LOG_LINES;
-    #endif
-    
-    #if LOG_MODE == LOG_SERIAL || LOG_MODE == LOG_BOTH
-        vprintf(fmt, args);
-        printf("\n");
-    #endif
-    
+    vsnprintf(lineBuf, sizeof(lineBuf) - 22, fmt, args);  // leave room for timestamp
     va_end(args);
+    
+    snprintf(logBuffer[logHead], LOG_LINE_LEN, "%s  %s", timeBuf, lineBuf);
+    logHead = (logHead + 1) % LOG_LINES;
+
+#if LOG_MODE == LOG_SERIAL || LOG_MODE == LOG_BOTH
+    printf("%s  %s\n", timeBuf, lineBuf);
+#endif
 }
 
 const char* wifiStatusToStr(uint8_t s) {
@@ -662,10 +669,7 @@ void WatchDogLora(void* parameter) {
         
         if (lastLoraRcv > 0 && elapsed > (LORA_MAX_SILENCE)) {
             cntLoraReset++;
-              getLocalTime(&timeinfo);
-              strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-
-            logMsg("WARN: no lora rcv for %lu min, kicking radio at: %s", elapsed / 60000, timeString);
+           logMsg("WARN: no lora rcv for %lu min, kicking radio", elapsed / 60000);
             if (xSemaphoreTake(loraMutex, pdMS_TO_TICKS(1000))) {
                 radio.standby();
                 radio.startReceive();
@@ -880,10 +884,7 @@ void connectMQTT() {
   if (now - lastMqttAttempt < MQTT_RETRY_INTERVAL) return;
   lastMqttAttempt = now;
  
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttConnecTime, sizeof(mqttConnecTime), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
- 
-  logMsg("connecting to mqtt broker %s:%d at: %s ...", MQTT_BROKER, MQTT_PORT, mqttConnecTime);
+  logMsg("connecting to mqtt broker %s:%d  ...", MQTT_BROKER, MQTT_PORT);
   
   if (mqtt.connect(MQTT_CLIENT_ID)) {
       //logMsg("MQTT connected");
@@ -898,41 +899,6 @@ void connectMQTT() {
   } else {
       Serial.print("!m");
       cntMDisCon++;
-  }
-}
-
-void mqttPubTempData() {
-  bool published;
-  StaticJsonDocument<200> message;
-  char topic[128];
-
-  snprintf(topic, sizeof(topic), "%s", mqttTopic);
-
-  message["timestamp"] = millis();
-  message["buffer5"] = bufTemp.tempBuf5;
-  message["buffer2"] = bufTemp.tempBuf2;
-  message["ww"] = bufTemp.tempWW;
-  char messageBuffer[512];
-  serializeJson(message, messageBuffer);
-
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
- 
-  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
-  if (published) {
-    NEO(ledColor.g = 255;)
-    logDbg("%s  mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPub++;
-    NEO(delay(200);)
-    NEO(ledColor.g = 0;)
-  }
-  else {
-    NEO(ledColor.g = 255;   ledColor.b = 255;)
-    logMsg("%s  ERROR mqtt pub temp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPubErr++;
-    NEO(delay(500);)
-    NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
 
@@ -979,15 +945,27 @@ void handleMqttRcv(String &payload) {
     else logMsg("handleMqttRcv, unknown cmd: %s", cmd);
 }
 
+void mqttPubTempData() {
+  StaticJsonDocument<200> message;
+  char topic[128];
+
+  snprintf(topic, sizeof(topic), "%s", mqttTopic);
+
+  message["timestamp"] = millis();
+  message["buffer5"] = bufTemp.tempBuf5;
+  message["buffer2"] = bufTemp.tempBuf2;
+  message["ww"] = bufTemp.tempWW;
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+
+  mqttLogPublish(topic, messageBuffer, "mqtt pub temp", false, 0); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+}
+
 void mqttPubLoraPwEn() {
-  bool published;
   StaticJsonDocument<200> message;
   char topic[128];
 
   snprintf(topic, sizeof(topic), "%s/data/pwen", mqttTopic);
-
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
 
   message["timestamp"] = mqttLastPublishDate;
   message["h6energy"] = h6PwEn.energy;
@@ -997,66 +975,28 @@ void mqttPubLoraPwEn() {
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
  
-  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
-  if (published) {
-    NEO(ledColor.g = 255;)
-    logDbg("%s  mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPub++;
-    NEO(delay(200);)
-    NEO(ledColor.g = 0;)
-  }
-  else {
-    NEO(ledColor.g = 255;   ledColor.b = 255;)
-    logMsg("%s  ERROR mqtt pub pwen, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPubErr++;
-    NEO(delay(500);)
-    NEO(ledColor.g = 0;   ledColor.b = 0;)
-  }
+  mqttLogPublish(topic, messageBuffer, "mqtt pub pwen", false, 0); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
 }
 
 void mqttPubLoraEnExp() {
-  bool published;
   StaticJsonDocument<200> message;
   char topic[128];
 
   snprintf(topic, sizeof(topic), "%s/data/enexp", mqttTopic);
-
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
 
   message["timestamp"] = mqttLastPublishDate;
   message["exportEnergy"] = h6EnExp.exportEnergy;
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
  
-  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer, true, 1); //retain and qos 1 to deal with ha restarts
-  if (published) {
-    NEO(ledColor.g = 255;)
-    logDbg("%s  mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPub++;
-    NEO(delay(200);)
-    NEO(ledColor.g = 0;)
-  }
-  else {
-    NEO(ledColor.g = 255;   ledColor.b = 255;)
-    logMsg("%s  ERROR mqtt pub enexp, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPubErr++;
-    NEO(delay(500);)
-    NEO(ledColor.g = 0;   ledColor.b = 0;)
-  }
+  mqttLogPublish(topic, messageBuffer, "mqtt pub enexp", true, 1); //retain and qos 1 to deal with ha restarts
 }
 
 void mqttPubLoraHealth() {
-  bool published;
   StaticJsonDocument<200> message;
   char topic[128];
 
   snprintf(topic, sizeof(topic), "%s/data/health", mqttTopic);
-
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
 
   message["timestamp"] = mqttLastPublishDate;
   message["uptime"] = h6Health.uptime;
@@ -1066,23 +1006,48 @@ void mqttPubLoraHealth() {
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
  
-  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer, true, 1); // true,1 for retain and QoS at least once, to deal with HA restarts //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+  mqttLogPublish(topic, messageBuffer, "mqtt pub health", true, 1); // true,1 for retain and QoS at least once, to deal with HA restarts //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+}
+
+void mqttPubLoraStatus() {
+  StaticJsonDocument<200> message;
+  char topic[128];
+
+  snprintf(topic, sizeof(topic), "%s/status", mqttTopic);
+
+  message["timestamp"] = mqttLastPublishDate;
+  message["rssi"] = loraStatus.rssi;
+  message["snr"] = loraStatus.snr;
+  message["checksumErr"] = loraStatus.cntCSerr;
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+
+   mqttLogPublish(topic, messageBuffer, "mqtt pub lorastatus", false, 0); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
+}
+
+void mqttLogPublish(const char *topic, const char *message, const char* log, bool retain, uint8_t qos) {
+  bool published = mqtt.publish(topic, message, retain, qos); //retain and qos 1 to deal with ha restarts
   if (published) {
     NEO(ledColor.g = 255;)
-    logDbg("%s  mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    logDbg("%s, topic: %s, payload: %s", log, topic, message);
     cntMPub++;
+    cntMPubConsec++;
+    if (cntMPubConsec > 20 && debugMode == true)
+      debugMode = false;  // after consecutive 20 good mqtt publish disable debug mode to now swap the file
     NEO(delay(200);)
     NEO(ledColor.g = 0;)
   }
   else {
     NEO(ledColor.g = 255;   ledColor.b = 255;)
-    logMsg("%s  ERROR mqtt pub health, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
+    logMsg(" ERROR %s, topic: %s, payload: %s", log, topic, message);
     cntMPubErr++;
+    cntMPubConsec = 0;
+    debugMode = true; // enable debug mode to see more details in the log
     NEO(delay(500);)
     NEO(ledColor.g = 0;   ledColor.b = 0;)
   }
 }
+
 // send mqtt commands to lora
 void sendLoraRequest(LoraTel cmd) {
     int16_t status;
@@ -1107,43 +1072,6 @@ void sendLoraRequest(LoraTel cmd) {
     }
 }
 
-void mqttPubLoraStatus() {
-  bool published;
-  StaticJsonDocument<200> message;
-  char topic[128];
-
-  snprintf(topic, sizeof(topic), "%s/status", mqttTopic);
-
-  getLocalTime(&mqttTimeInfo);
-  strftime(mqttLastPublishDate, sizeof(mqttLastPublishDate), "%Y-%m-%d %H:%M:%S", &mqttTimeInfo);
-
-  message["timestamp"] = mqttLastPublishDate;
-  message["rssi"] = loraStatus.rssi;
-  message["snr"] = loraStatus.snr;
-  message["checksumErr"] = loraStatus.cntCSerr;
-  char messageBuffer[512];
-  serializeJson(message, messageBuffer);
-
- 
-  // starting to supect that the retCode is not meaningful in this case, the original code did not have it
-  published = mqtt.publish(topic, messageBuffer); //, false, 1); // no retain, qos 0, without them getting retCode 1 even if data arrive in HA, qos 1 still responds with 1
-  if (published) {
-    NEO(ledColor.g = 255;)
-    //logDbg("%s  mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPub++;
-    NEO(delay(200);)
-    NEO(ledColor.g = 0;)
-  }
-  else {
-    NEO(ledColor.g = 255;   ledColor.b = 255;)
-    logMsg("%s  ERROR mqtt pub lorastatus, topic: %s, payload: %s", mqttLastPublishDate, topic, messageBuffer);
-    cntMPubErr++;
-    logMsg("  publish failed, forcing reconnect");
-    mqtt.disconnect();   // force state reset
-    NEO(delay(500);)
-    NEO(ledColor.g = 0;   ledColor.b = 0;)
-  }
-}
 // ==================== html server pages, thanks ChatGPT, well, besides the test or testLED fiasko
 void handleRoot() {
 #if LAN == 1  
@@ -1228,8 +1156,8 @@ void handleRoot() {
 #if MQTTenable == 1  
   html += "<p>mqtt broker: " + String(MQTT_BROKER) + ", client: " + String(MQTT_CLIENT_ID) + ", topic: " + String(mqttTopic)  +
           "<br>Last Published: " + String(mqttLastPublishDate) + ", connected: " + String(mqttConnected) + "</p>";
-  html += "<p><ul><li>mqtt pubs: " + String(cntMPub) + "</li><li>mqtt pub errors: " + String(cntMPubErr) + "</li><li>mqtt reconnects: " + String(cntMReCon) + 
-          "</li><li>mqtt disconnects: " + String(cntMDisCon) + "</li>";
+  html += "<p><ul><li>mqtt pubs: " + String(cntMPub) + ", consec: " + String(cntMPubConsec) + ", pub errors: " + String(cntMPubErr) + "</li>";
+  html += "<li>mqtt reconnects: " + String(cntMReCon) + ", disconnects: " + String(cntMDisCon) + "</li>";
   html += "<li>mqtt rcv: " + String(cntMRcv) + "</li>";        
   html += "</ul></p>";
 #endif  
@@ -1538,6 +1466,7 @@ void loop() {
 // 3.2.1 add html logging, move version info to the bottom
 // 3.2.4 fix multi mqtt loop after receiver running in loop(), merge led code back in
 // 3.2.5 add lora watchdog task to attempt to remedy receive hangs
+// 3.2.7 refactor mqtt send and auto turn on debugmode on error
 
 /*
 radio.setFrequency(868.0);       // Frequency in MHz
